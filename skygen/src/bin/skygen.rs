@@ -14,6 +14,7 @@
 
 use anyhow::{bail, Context};
 use skygen::generator::project::{bootstrap_lib, format_crate};
+use skygen::resolver::resolve::Resolver;
 use structopt::StructOpt;
 use tokio::fs;
 use tracing_subscriber::EnvFilter;
@@ -48,7 +49,7 @@ async fn main() -> anyhow::Result<()> {
             // If sanitization becomes a habbit in the other specs, move this to a fn
             let safe_data = d.replace("18446744073709552000", "18446744073709551615");
 
-            let _schema_json: serde_json::Value = match extension.to_lowercase().as_str() {
+            let schema_json: serde_json::Value = match extension.to_lowercase().as_str() {
                 "yaml" | "yml" => serde_yaml::from_str(safe_data.as_str())
                     .with_context(|| "failed to parse YAML")?,
                 "json" => serde_json::from_str(safe_data.as_str())
@@ -56,8 +57,15 @@ async fn main() -> anyhow::Result<()> {
                 _ => bail!("unsupported file extension: {extension}"),
             };
 
-            // let _spec: openapiv3::OpenAPI = serde_json::from_value(schema_json)
-            //     .with_context(|| "failed to conver into OpenAPIv3 spec")?;
+            let spec: openapiv3::OpenAPI = serde_json::from_value(schema_json)
+                .with_context(|| "failed to conver into OpenAPIv3 spec")?;
+
+            let resolved = Resolver::new(spec)
+                .resolve()
+                .with_context(|| "failed to resolve schema")?;
+
+            println!("{:#?}", resolved);
+
             bootstrap_lib(&config, &args.output)
                 .await
                 .with_context(|| "failed to bootstrap library")?;
