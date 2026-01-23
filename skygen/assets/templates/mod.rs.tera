@@ -16,6 +16,5 @@
 // limitations under the License.
 
 {% set modules = modules | default(value=[]) %}
-{% for module in modules %}
-pub mod {{ module }};
-{% endfor %}
+{% for module in modules %}pub mod {{ module }};{% if not loop.last %}
+{% endif %}{% endfor %}

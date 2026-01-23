@@ -15,24 +15,40 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-{% if alias %}
-pub type {{ name }} = {{ alias }};
-{% else %}
 use serde::{Deserialize, Serialize};
+{% if model.deps is defined and model.deps | length > 0 %}
+{% if model.deps | length == 1 %}
+use crate::models::{{ model.deps | first }};
+{% else %}
+use crate::models::{ {{ model.deps | join(sep=", ") }} };
+{% endif %}
+{% endif %}
 
+{% if model.kind.Struct is defined %}
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct {{ name }} {
-{%- if fields | length == 0 %}
+pub struct {{ model.rust_name | default(value=model.name) }} {
+{% for field in model.kind.Struct.fields %}
+    {% if field.flatten %}#[serde(flatten)]{% else %}#[serde(rename = "{{ field.name }}")]{% endif %}
+    pub {{ field.rust_name }}: {% if field.required and not field.nullable %}{{ field.render_type }}{% else %}Option<{{ field.render_type }}>{% endif %},
+{% endfor %}
 }
-{%- else %}
-{%- for field in fields %}
-    {%- if field.flatten %}
+{% elif model.kind.Composite is defined %}
+{% if model.kind.Composite.flavor == "AllOf" %}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct {{ model.rust_name | default(value=model.name) }} {
+{% for variant in model.kind.Composite.render_variants %}
     #[serde(flatten)]
-    pub {{ field.name }}: {{ field.ty }},
-    {%- else %}
-    pub {{ field.name }}: {% if field.required %}{{ field.ty }}{% else %}Option<{{ field.ty }}>{% endif %},
-    {%- endif %}
-{%- endfor %}
+    pub part_{{ loop.index }}: {{ variant }},
+{% endfor %}
 }
-{%- endif %}
+{% else %}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum {{ model.rust_name | default(value=model.name) }} {
+{% for variant in model.kind.Composite.render_variants %}
+    Variant{{ loop.index }}({{ variant }}),
+{% endfor %}
+}
+{% endif %}
+{% else %}
+pub type {{ model.rust_name | default(value=model.name) }} = {{ model.render_type | default(value="serde_json::Value") }};
 {% endif %}
