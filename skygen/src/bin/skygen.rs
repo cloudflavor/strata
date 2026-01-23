@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use anyhow::{bail, Context};
+use skygen::generator::model::ModelGenerator;
 use skygen::generator::project::{bootstrap_lib, format_crate};
 use skygen::resolver::resolve::Resolver;
 use structopt::StructOpt;
@@ -64,9 +65,12 @@ async fn main() -> anyhow::Result<()> {
                 .resolve()
                 .with_context(|| "failed to resolve schema")?;
 
-            println!("{:#?}", resolved);
+            let generator = ModelGenerator::new();
+            let registry = generator
+                .collect_models(&resolved)
+                .with_context(|| "failed to collect models")?;
 
-            bootstrap_lib(&config, &args.output)
+            bootstrap_lib(&config, registry, &args.output)
                 .await
                 .with_context(|| "failed to bootstrap library")?;
 
