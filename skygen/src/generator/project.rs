@@ -28,26 +28,53 @@ pub struct RenderPlan {
     extra_ctx: Option<TeraContext>,
 }
 
-async fn render_templates(
-    tera: &tera::Tera,
-    root: &Path,
-    base: &mut TeraContext,
+// Separated rendering logic for easier testing
+pub fn render_project_templates(
+    tera: &Tera,
+    base_ctx: &TeraContext,
     plans: &[RenderPlan],
-) -> Result<()> {
+) -> Result<Vec<String>> {
+    let mut rendered_data = Vec::new();
+    let mut ctx = base_ctx.clone();
+
     for p in plans {
-        if let Some(extra_ctx) = p.extra_ctx.to_owned() {
-            base.extend(extra_ctx);
+        if let Some(extra_ctx) = &p.extra_ctx {
+            ctx.extend(extra_ctx.clone());
         }
-        let mut data = tera.render(p.template, &base)?;
+        let data = tera.render(p.template, &ctx)?;
+        rendered_data.push(data);
+    }
+    Ok(rendered_data)
+}
+
+// Separated file writing logic for easier testing
+pub async fn write_project_files(root: &Path, plans: &[RenderPlan], rendered_data: &[String]) -> Result<()> {
+    for (p, data) in plans.iter().zip(rendered_data.iter()) {
         // NOTE: avoid using the taplo CLI for formatting the Cargo.toml file after tera rendering
         if p.out_rel == "Cargo.toml" {
-            data = formatter::format(&data, formatter::Options::default());
+            let formatted = formatter::format(data, formatter::Options::default());
+            let out = root.join(&p.out_rel);
+            fs::write(out, formatted).await?;
+        } else {
+            let out = root.join(&p.out_rel);
+            fs::write(out, data).await?;
         }
-        let out = root.join(&p.out_rel);
-
-        fs::write(out, data).await?;
     }
+    Ok(())
+}
 
+// Separated file writing logic for easier testing
+pub async fn write_static_files(root: &Path, plans: &[RenderPlan]) -> Result<()> {
+    for p in plans {
+        let f = crate::ASSETS
+            .get_file(p.template)
+            .with_context(|| "failed to fetch static rust file")?;
+        let data = f
+            .contents_utf8()
+            .with_context(|| "failed to fetch utf8 contents from rust file")?;
+        let out = root.join(&p.out_rel);
+        fs::write(&out, data).await?;
+    }
     Ok(())
 }
 
@@ -60,67 +87,64 @@ pub async fn bootstrap_lib(
         .await
         .with_context(|| "failed to create project directories")?;
 
-    let mut tera = Tera::default();
-    for name in [
+    // Load templates
+    let template_names = [
         "templates/cargo.toml.tera",
         "templates/operation.rs.tera",
         "templates/model.rs.tera",
         "templates/lib.rs.tera",
         "templates/mod.rs.tera",
-    ] {
-        let f = crate::ASSETS
-            .get_file(name)
-            .with_context(|| "failed to fetch template")?;
+    ];
+    let tera = load_templates(&template_names)?;
 
-        tera.add_raw_template(
-            name,
-            f.contents_utf8()
-                .with_context(|| "failed to fetch utf8 contents from template")?,
-        )?;
-    }
-
+    // Set up base context
     let mut base_ctx = TeraContext::new();
     base_ctx.insert("config", config);
 
-    let plans = [
+    // Render main project files
+    let main_plans = [
         RenderPlan {
             template: "templates/cargo.toml.tera",
-            out_rel: String::from("Cargo.toml"),
+            out_rel: "Cargo.toml".to_string(),
             extra_ctx: None,
         },
         RenderPlan {
             template: "templates/lib.rs.tera",
-            out_rel: String::from("src/lib.rs"),
+            out_rel: "src/lib.rs".to_string(),
             extra_ctx: None,
         },
         RenderPlan {
             template: "templates/mod.rs.tera",
-            out_rel: String::from("src/apis/mod.rs"),
+            out_rel: "src/apis/mod.rs".to_string(),
             extra_ctx: None,
         },
         RenderPlan {
             template: "templates/mod.rs.tera",
-            out_rel: String::from("src/models/mod.rs"),
+            out_rel: "src/models/mod.rs".to_string(),
             extra_ctx: None,
         },
     ];
-    render_templates(&tera, out_dir.as_ref(), &mut base_ctx, &plans).await?;
 
+    let rendered_data = render_project_templates(&tera, &base_ctx, &main_plans)?;
+    write_project_files(out_dir.as_ref(), &main_plans, &rendered_data).await?;
+
+    // Write additional Rust files
     let rs_files = [
         RenderPlan {
             template: "lib/client.rs",
-            out_rel: String::from("src/client.rs"),
+            out_rel: "src/client.rs".to_string(),
             extra_ctx: None,
         },
         RenderPlan {
             template: "lib/errors.rs",
-            out_rel: String::from("src/errors.rs"),
+            out_rel: "src/errors.rs".to_string(),
             extra_ctx: None,
         },
     ];
 
-    write_rs_files(out_dir.as_ref(), &rs_files).await?;
+    write_static_files(out_dir.as_ref(), &rs_files).await?;
 
+    // Generate model files
     let mut models: Vec<RenderPlan> = Vec::new();
     let mut mods = Vec::new();
 
@@ -136,17 +160,20 @@ pub async fn bootstrap_lib(
             extra_ctx: Some(model_ctx),
         });
     }
+
+    // Add module context for models
     let mut mods_ctx = TeraContext::new();
     mods_ctx.insert("modules", &mods);
 
     models.push(RenderPlan {
         template: "templates/mod.rs.tera",
-        out_rel: String::from("src/models/mod.rs"),
+        out_rel: "src/models/mod.rs".to_string(),
         extra_ctx: Some(mods_ctx),
     });
 
-    let mut models_ctx = TeraContext::new();
-    render_templates(&tera, out_dir.as_ref(), &mut models_ctx, &models).await?;
+    let models_ctx = TeraContext::new();
+    let rendered_model_data = render_project_templates(&tera, &models_ctx, &models)?;
+    write_project_files(out_dir.as_ref(), &models, &rendered_model_data).await?;
 
     Ok(())
 }
@@ -166,22 +193,6 @@ pub fn load_templates(names: &[&str]) -> Result<Tera> {
         )?;
     }
     Ok(tera)
-}
-
-async fn write_rs_files(root: &Path, plans: &[RenderPlan]) -> Result<()> {
-    for p in plans {
-        let f = crate::ASSETS
-            .get_file(p.template)
-            .with_context(|| "failed to fetch static rust file")?;
-        let data = f
-            .contents_utf8()
-            .with_context(|| "failed to fetch utf8 contents from rust file")?;
-        let out = root.join(&p.out_rel);
-
-        fs::write(&out, data).await?
-    }
-
-    Ok(())
 }
 
 async fn create_dirs(root_dir: &Path) -> Result<()> {
