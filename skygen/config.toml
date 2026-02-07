@@ -1,0 +1,31 @@
+# Skygen Configuration Example
+
+# The name of the generated Rust crate
+crate_name = "digitalocean-sdk"
+
+# The version of the generated crate
+version = "0.1.0"
+
+# The Rust edition to use (defaults to "2021")
+edition = "2021"
+
+# A brief description of the crate
+description = "A Rust SDK for DigitalOcean API"
+
+# The maintenance status of the library
+lib_status = "active"
+
+# A list of keywords for the crate
+keywords = ["digitalocean", "api", "sdk", "cloud"]
+
+# The base URL for the API
+api_url = "https://api.digitalocean.com"
+
+# A list of authors for the crate
+authors = ["Cloudflavor GmbH <foss@cloudflavor.io>"]
+
+# Optional: A list of models to include (if not specified, all models are included)
+# include_only = ["Droplet", "Region", "Size"]
+
+# Optional: A list of models to exclude
+# exclude = ["Metadata", "Links"]
