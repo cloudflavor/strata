@@ -14,6 +14,7 @@
 
 use anyhow::{bail, Context};
 use skygen::generator::model::ModelGenerator;
+use skygen::generator::operation::OperationGenerator;
 use skygen::generator::project::{bootstrap_lib, format_crate};
 use skygen::resolver::resolve::Resolver;
 use structopt::StructOpt;
@@ -70,7 +71,12 @@ async fn main() -> anyhow::Result<()> {
                 .collect_models(&resolved)
                 .with_context(|| "failed to collect models")?;
 
-            bootstrap_lib(&config, registry, &args.output)
+            let op_generator = OperationGenerator::new();
+            let ops = op_generator
+                .collect_operations(&resolved)
+                .with_context(|| "failed to collect operations")?;
+
+            bootstrap_lib(&config, registry, ops, &args.output)
                 .await
                 .with_context(|| "failed to bootstrap library")?;
 
