@@ -18,3 +18,6 @@
 {% set modules = modules | default(value=[]) %}
 {% for module in modules %}pub mod {{ module }};{% if not loop.last %}
 {% endif %}{% endfor %}
+
+{% for module in modules %}pub use {{ module }}::*;{% if not loop.last %}
+{% endif %}{% endfor %}
