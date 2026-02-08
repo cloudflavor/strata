@@ -94,7 +94,12 @@ impl ModelGenerator {
         match kind {
             SchemaKind::Type(typ) => self.type_to_model_type(typ),
             SchemaKind::OneOf { one_of } => {
-                let variants = self.refs_to_types(one_of)?;
+                let mut variants = self.refs_to_types(one_of)?;
+                variants.retain(|variant| !matches!(variant, ModelType::Opaque));
+                dedupe_composite_variants(&mut variants);
+                if variants.is_empty() {
+                    return Ok(ModelType::Opaque);
+                }
                 let render_variants = variants.iter().map(model_type_to_rust).collect();
                 Ok(ModelType::Composite(ModelComposite {
                     flavor: CompositeFlavor::OneOf,
@@ -103,7 +108,12 @@ impl ModelGenerator {
                 }))
             }
             SchemaKind::AnyOf { any_of } => {
-                let variants = self.refs_to_types(any_of)?;
+                let mut variants = self.refs_to_types(any_of)?;
+                variants.retain(|variant| !matches!(variant, ModelType::Opaque));
+                dedupe_composite_variants(&mut variants);
+                if variants.is_empty() {
+                    return Ok(ModelType::Opaque);
+                }
                 let render_variants = variants.iter().map(model_type_to_rust).collect();
                 Ok(ModelType::Composite(ModelComposite {
                     flavor: CompositeFlavor::AnyOf,
@@ -217,6 +227,19 @@ impl ModelGenerator {
                     sig_to_name,
                 )?;
             }
+            ModelType::Composite(comp) => {
+                for variant in comp.variants.iter_mut() {
+                    changed |= self.hoist_in_type(
+                        &model.name,
+                        None,
+                        variant,
+                        additions,
+                        existing,
+                        name_to_sig,
+                        sig_to_name,
+                    )?;
+                }
+            }
             _ => {}
         }
 
@@ -303,7 +326,7 @@ impl ModelGenerator {
                     *inner = Box::new(ModelType::Ref(name));
                     Ok(true)
                 }
-                ModelType::Array(_) => self.hoist_in_type(
+                _ => self.hoist_in_type(
                     parent_name,
                     field_name,
                     inner.as_mut(),
@@ -312,8 +335,55 @@ impl ModelGenerator {
                     name_to_sig,
                     sig_to_name,
                 ),
-                _ => Ok(false),
             },
+            ModelType::Composite(comp) => {
+                for variant in comp.variants.iter_mut() {
+                    self.hoist_in_type(
+                        parent_name,
+                        field_name,
+                        variant,
+                        additions,
+                        existing,
+                        name_to_sig,
+                        sig_to_name,
+                    )?;
+                }
+                dedupe_composite_variants(&mut comp.variants);
+                comp.render_variants = comp.variants.iter().map(model_type_to_rust).collect();
+
+                let sig = {
+                    let snapshot = ModelType::Composite(comp.clone());
+                    type_signature(&snapshot)
+                };
+                if let Some(existing_name) = sig_to_name.get(&sig) {
+                    *typ = ModelType::Ref(existing_name.clone());
+                    return Ok(true);
+                }
+
+                let name = self.inline_model_name(
+                    parent_name,
+                    field_name,
+                    false,
+                    &sig,
+                    existing,
+                    name_to_sig,
+                );
+                let rust_name = sanitize_type_name(&name);
+                let render_type = String::new();
+                let def = ModelDef {
+                    name: name.clone(),
+                    rust_name,
+                    render_type,
+                    deps: Vec::new(),
+                    dep_imports: Vec::new(),
+                    kind: ModelType::Composite(comp.clone()),
+                };
+                additions.push((name.clone(), def));
+                name_to_sig.insert(name.clone(), sig.clone());
+                sig_to_name.insert(sig, name.clone());
+                *typ = ModelType::Ref(name);
+                Ok(true)
+            }
             _ => Ok(false),
         }
     }
@@ -355,10 +425,17 @@ impl ModelGenerator {
     fn refresh_render_types(&self, registry: &mut ModelRegistry) {
         for model in registry.models.values_mut() {
             model.render_type = model_type_to_rust(&model.kind);
-            if let ModelType::Struct(def) = &mut model.kind {
-                for field in &mut def.fields {
-                    field.render_type = model_type_to_rust(&field.typ);
+            match &mut model.kind {
+                ModelType::Struct(def) => {
+                    for field in &mut def.fields {
+                        field.render_type = model_type_to_rust(&field.typ);
+                    }
                 }
+                ModelType::Composite(comp) => {
+                    dedupe_composite_variants(&mut comp.variants);
+                    comp.render_variants = comp.variants.iter().map(model_type_to_rust).collect();
+                }
+                _ => {}
             }
         }
     }
@@ -441,7 +518,12 @@ impl ModelGenerator {
         }
 
         if !schema.one_of.is_empty() {
-            let variants = self.refs_to_types(&schema.one_of)?;
+            let mut variants = self.refs_to_types(&schema.one_of)?;
+            variants.retain(|variant| !matches!(variant, ModelType::Opaque));
+            dedupe_composite_variants(&mut variants);
+            if variants.is_empty() {
+                return Ok(ModelType::Opaque);
+            }
             let render_variants = variants.iter().map(model_type_to_rust).collect();
             return Ok(ModelType::Composite(ModelComposite {
                 flavor: CompositeFlavor::OneOf,
@@ -451,7 +533,12 @@ impl ModelGenerator {
         }
 
         if !schema.any_of.is_empty() {
-            let variants = self.refs_to_types(&schema.any_of)?;
+            let mut variants = self.refs_to_types(&schema.any_of)?;
+            variants.retain(|variant| !matches!(variant, ModelType::Opaque));
+            dedupe_composite_variants(&mut variants);
+            if variants.is_empty() {
+                return Ok(ModelType::Opaque);
+            }
             let render_variants = variants.iter().map(model_type_to_rust).collect();
             return Ok(ModelType::Composite(ModelComposite {
                 flavor: CompositeFlavor::AnyOf,
@@ -834,6 +921,11 @@ fn type_signature(typ: &ModelType) -> String {
     }
 }
 
+fn dedupe_composite_variants(variants: &mut Vec<ModelType>) {
+    let mut seen = HashSet::new();
+    variants.retain(|variant| seen.insert(type_signature(variant)));
+}
+
 fn composite_flavor_name(flavor: CompositeFlavor) -> &'static str {
     match flavor {
         CompositeFlavor::OneOf => "oneOf",
@@ -968,15 +1060,23 @@ fn collect_deps_from_type(typ: &ModelType, deps: &mut indexmap::IndexSet<String>
         ModelType::Ref(name) => {
             deps.insert(sanitize_type_name(name));
         }
-        ModelType::Array(inner) => collect_deps_from_type(inner, deps),
+        ModelType::Array(inner) => {
+            if model_type_to_rust(inner) != "serde_json::Value" {
+                collect_deps_from_type(inner, deps)
+            }
+        }
         ModelType::Struct(def) => {
             for field in &def.fields {
-                collect_deps_from_type(&field.typ, deps);
+                if model_type_to_rust(&field.typ) != "serde_json::Value" {
+                    collect_deps_from_type(&field.typ, deps);
+                }
             }
         }
         ModelType::Composite(comp) => {
             for variant in &comp.variants {
-                collect_deps_from_type(variant, deps);
+                if model_type_to_rust(variant) != "serde_json::Value" {
+                    collect_deps_from_type(variant, deps);
+                }
             }
         }
         ModelType::Primitive(_) | ModelType::Opaque => {}
@@ -1021,6 +1121,11 @@ pub fn sanitize_module_name(name: &str) -> String {
             out.push('_');
         }
     }
+    // Collapse repeated underscores and trim leading/trailing ones.
+    while out.contains("__") {
+        out = out.replace("__", "_");
+    }
+    out = out.trim_matches('_').to_string();
     if out.is_empty() {
         "_".into()
     } else {
