@@ -13,16 +13,16 @@
 // limitations under the License.
 
 use crate::generator::model::{
-    model_type_to_rust, sanitize_field_name, sanitize_module_name, sanitize_type_name,
-    ModelGenerator, ModelType,
+    group_dep_imports, model_type_to_rust, sanitize_field_name, sanitize_module_name,
+    sanitize_type_name, DepImport, ModelGenerator, ModelRegistry, ModelType,
 };
 use anyhow::{anyhow, Result};
 use indexmap::IndexMap;
-use serde::Serialize;
 use openapiv3::{
     MediaType, OpenAPI, Operation, Parameter, ParameterSchemaOrContent, PathItem, ReferenceOr,
     RequestBody, Response, StatusCode,
 };
+use serde::Serialize;
 
 #[derive(Debug, Default)]
 pub struct OperationGenerator;
@@ -32,7 +32,11 @@ impl OperationGenerator {
         Self
     }
 
-    pub fn collect_operations(&self, doc: &OpenAPI) -> Result<OperationRegistry> {
+    pub fn collect_operations(
+        &self,
+        doc: &OpenAPI,
+        models: &ModelRegistry,
+    ) -> Result<OperationRegistry> {
         let mut registry = OperationRegistry::default();
         let mut seen_ids = indexmap::IndexSet::new();
 
@@ -44,7 +48,7 @@ impl OperationGenerator {
                 }
             };
 
-            self.collect_from_item(path, item, &mut registry, &mut seen_ids)?;
+            self.collect_from_item(path, item, models, &mut registry, &mut seen_ids)?;
         }
 
         Ok(registry)
@@ -54,32 +58,33 @@ impl OperationGenerator {
         &self,
         path: &str,
         item: &PathItem,
+        models: &ModelRegistry,
         registry: &mut OperationRegistry,
         seen_ids: &mut indexmap::IndexSet<String>,
     ) -> Result<()> {
         if let Some(op) = item.get.as_ref() {
-            self.push_op("get", path, item, op, registry, seen_ids);
+            self.push_op("get", path, item, op, models, registry, seen_ids);
         }
         if let Some(op) = item.put.as_ref() {
-            self.push_op("put", path, item, op, registry, seen_ids);
+            self.push_op("put", path, item, op, models, registry, seen_ids);
         }
         if let Some(op) = item.post.as_ref() {
-            self.push_op("post", path, item, op, registry, seen_ids);
+            self.push_op("post", path, item, op, models, registry, seen_ids);
         }
         if let Some(op) = item.delete.as_ref() {
-            self.push_op("delete", path, item, op, registry, seen_ids);
+            self.push_op("delete", path, item, op, models, registry, seen_ids);
         }
         if let Some(op) = item.options.as_ref() {
-            self.push_op("options", path, item, op, registry, seen_ids);
+            self.push_op("options", path, item, op, models, registry, seen_ids);
         }
         if let Some(op) = item.head.as_ref() {
-            self.push_op("head", path, item, op, registry, seen_ids);
+            self.push_op("head", path, item, op, models, registry, seen_ids);
         }
         if let Some(op) = item.patch.as_ref() {
-            self.push_op("patch", path, item, op, registry, seen_ids);
+            self.push_op("patch", path, item, op, models, registry, seen_ids);
         }
         if let Some(op) = item.trace.as_ref() {
-            self.push_op("trace", path, item, op, registry, seen_ids);
+            self.push_op("trace", path, item, op, models, registry, seen_ids);
         }
 
         Ok(())
@@ -91,6 +96,7 @@ impl OperationGenerator {
         path: &str,
         item: &PathItem,
         op: &Operation,
+        models: &ModelRegistry,
         registry: &mut OperationRegistry,
         seen_ids: &mut indexmap::IndexSet<String>,
     ) {
@@ -112,11 +118,12 @@ impl OperationGenerator {
                 has_default: false,
             },
             deps: Vec::new(),
+            dep_imports: Vec::new(),
             group: sanitize_module_name(op.tags.first().map(|s| s.as_str()).unwrap_or("default")),
             params: Vec::new(),
         };
 
-        let model_gen = ModelGenerator::new();
+        let model_gen = ModelGenerator::with_module_name_map(models.name_map.clone());
 
         def.params = collect_parameters(
             &model_gen,
@@ -132,6 +139,7 @@ impl OperationGenerator {
         def.responses = responses_to_types(&model_gen, &op.responses);
         def.response_enum = build_response_enum(&def);
         def.deps = collect_operation_deps(&def);
+        def.dep_imports = group_dep_imports(&def.deps, &models.type_map);
 
         registry.ops.insert(def.id.clone(), def);
     }
@@ -162,6 +170,7 @@ pub struct OperationDef {
     pub responses: Vec<OperationResponse>,
     pub response_enum: OperationResponseEnum,
     pub deps: Vec<String>,
+    pub dep_imports: Vec<DepImport>,
     pub group: String,
     pub params: Vec<OperationParam>,
 }
@@ -332,9 +341,7 @@ fn build_response_enum(def: &OperationDef) -> OperationResponseEnum {
 
     for response in &def.responses {
         let (base, status_match, is_default) = match response.status.as_ref() {
-            Some(StatusCode::Code(code)) => {
-                (format!("Status{code}"), format!("{code}"), false)
-            }
+            Some(StatusCode::Code(code)) => (format!("Status{code}"), format!("{code}"), false),
             Some(StatusCode::Range(range)) => {
                 let start = range * 100;
                 let end = start + 99;
@@ -395,6 +402,7 @@ fn collect_operation_deps(def: &OperationDef) -> Vec<String> {
     out.sort();
     out
 }
+
 
 fn collect_deps_from_type(typ: &ModelType, deps: &mut indexmap::IndexSet<String>) {
     match typ {
@@ -499,11 +507,11 @@ fn parameter_to_param(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indexmap::IndexMap;
     use openapiv3::{
         MediaType, Parameter, ParameterData, ParameterSchemaOrContent, Paths, ReferenceOr,
         RequestBody, Response, Schema, StatusCode, Type,
     };
-    use indexmap::IndexMap;
 
     fn make_doc() -> OpenAPI {
         OpenAPI {
@@ -515,6 +523,7 @@ mod tests {
     #[test]
     fn collects_operations_with_ids() {
         let mut doc = make_doc();
+        let models = ModelRegistry::default();
         let mut item = PathItem::default();
         let mut op = Operation::default();
         op.operation_id = Some("get_user".into());
@@ -524,7 +533,7 @@ mod tests {
             .insert("/users/{id}".into(), ReferenceOr::Item(item));
 
         let registry = OperationGenerator::new()
-            .collect_operations(&doc)
+            .collect_operations(&doc, &models)
             .expect("collect");
         let op = registry.get("get_user").expect("operation");
         assert_eq!(op.method, "get");
@@ -534,6 +543,7 @@ mod tests {
     #[test]
     fn falls_back_to_method_path_id() {
         let mut doc = make_doc();
+        let models = ModelRegistry::default();
         let mut item = PathItem::default();
         item.post = Some(Operation::default());
         doc.paths
@@ -541,7 +551,7 @@ mod tests {
             .insert("/widgets/{id}".into(), ReferenceOr::Item(item));
 
         let registry = OperationGenerator::new()
-            .collect_operations(&doc)
+            .collect_operations(&doc, &models)
             .expect("collect");
         let op = registry.get("post__widgets__id_").expect("operation");
         assert_eq!(op.method, "post");
@@ -551,6 +561,7 @@ mod tests {
     #[test]
     fn disambiguates_duplicate_ids() {
         let mut doc = make_doc();
+        let models = ModelRegistry::default();
         let mut item_a = PathItem::default();
         let mut op_a = Operation::default();
         op_a.operation_id = Some("list".into());
@@ -568,7 +579,7 @@ mod tests {
             .insert("/b".into(), ReferenceOr::Item(item_b));
 
         let registry = OperationGenerator::new()
-            .collect_operations(&doc)
+            .collect_operations(&doc, &models)
             .expect("collect");
         assert!(registry.get("list").is_some());
         assert!(registry.get("list_2").is_some());
@@ -577,6 +588,7 @@ mod tests {
     #[test]
     fn assigns_group_from_tag() {
         let mut doc = make_doc();
+        let models = ModelRegistry::default();
         let mut item = PathItem::default();
         let mut op = Operation::default();
         op.tags = vec!["Audit Logs".into()];
@@ -586,7 +598,7 @@ mod tests {
             .insert("/audit".into(), ReferenceOr::Item(item));
 
         let registry = OperationGenerator::new()
-            .collect_operations(&doc)
+            .collect_operations(&doc, &models)
             .expect("collect");
         let op = registry.get("get__audit").expect("operation");
         assert_eq!(op.group, "audit_logs");
@@ -595,6 +607,7 @@ mod tests {
     #[test]
     fn collects_parameters_from_path_and_operation() {
         let mut doc = make_doc();
+        let models = ModelRegistry::default();
         let mut item = PathItem::default();
         let mut op = Operation::default();
 
@@ -644,7 +657,7 @@ mod tests {
             .insert("/items/{id}".into(), ReferenceOr::Item(item));
 
         let registry = OperationGenerator::new()
-            .collect_operations(&doc)
+            .collect_operations(&doc, &models)
             .expect("collect");
         let op = registry.get("get__items__id_").expect("operation");
         assert_eq!(op.params.len(), 2);
@@ -670,6 +683,7 @@ mod tests {
     #[test]
     fn selects_json_request_body_type() {
         let mut doc = make_doc();
+        let models = ModelRegistry::default();
         let mut item = PathItem::default();
         let mut op = Operation::default();
         let mut body = RequestBody::default();
@@ -705,7 +719,7 @@ mod tests {
             .insert("/widgets".into(), ReferenceOr::Item(item));
 
         let registry = OperationGenerator::new()
-            .collect_operations(&doc)
+            .collect_operations(&doc, &models)
             .expect("collect");
         let op = registry.get("post__widgets").expect("operation");
         let body = op.request_body.as_ref().expect("body");
@@ -717,6 +731,7 @@ mod tests {
     #[test]
     fn collects_response_types() {
         let mut doc = make_doc();
+        let models = ModelRegistry::default();
         let mut item = PathItem::default();
         let mut op = Operation::default();
 
@@ -731,17 +746,16 @@ mod tests {
                 ..Default::default()
             },
         );
-        op.responses.responses.insert(
-            StatusCode::Code(200),
-            ReferenceOr::Item(response),
-        );
+        op.responses
+            .responses
+            .insert(StatusCode::Code(200), ReferenceOr::Item(response));
         item.get = Some(op);
         doc.paths
             .paths
             .insert("/status".into(), ReferenceOr::Item(item));
 
         let registry = OperationGenerator::new()
-            .collect_operations(&doc)
+            .collect_operations(&doc, &models)
             .expect("collect");
         let op = registry.get("get__status").expect("operation");
         assert_eq!(op.responses.len(), 1);
@@ -754,6 +768,7 @@ mod tests {
     #[test]
     fn builds_response_enum_variants() {
         let mut doc = make_doc();
+        let models = ModelRegistry::default();
         let mut item = PathItem::default();
         let mut op = Operation::default();
 
@@ -768,17 +783,16 @@ mod tests {
                 ..Default::default()
             },
         );
-        op.responses.responses.insert(
-            StatusCode::Code(200),
-            ReferenceOr::Item(response),
-        );
+        op.responses
+            .responses
+            .insert(StatusCode::Code(200), ReferenceOr::Item(response));
         item.get = Some(op);
         doc.paths
             .paths
             .insert("/status".into(), ReferenceOr::Item(item));
 
         let registry = OperationGenerator::new()
-            .collect_operations(&doc)
+            .collect_operations(&doc, &models)
             .expect("collect");
         let op = registry.get("get__status").expect("operation");
         let response_enum = &op.response_enum;
@@ -794,6 +808,7 @@ mod tests {
     #[test]
     fn collects_operation_deps() {
         let mut doc = make_doc();
+        let models = ModelRegistry::default();
         let mut item = PathItem::default();
         let mut op = Operation::default();
 
@@ -807,17 +822,16 @@ mod tests {
                 ..Default::default()
             },
         );
-        op.responses.responses.insert(
-            StatusCode::Code(200),
-            ReferenceOr::Item(response),
-        );
+        op.responses
+            .responses
+            .insert(StatusCode::Code(200), ReferenceOr::Item(response));
         item.get = Some(op);
         doc.paths
             .paths
             .insert("/widgets".into(), ReferenceOr::Item(item));
 
         let registry = OperationGenerator::new()
-            .collect_operations(&doc)
+            .collect_operations(&doc, &models)
             .expect("collect");
         let op = registry.get("get__widgets").expect("operation");
         assert_eq!(op.deps, vec!["Widget"]);

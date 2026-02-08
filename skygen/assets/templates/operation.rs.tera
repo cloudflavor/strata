@@ -21,13 +21,15 @@ use reqwest::Method;
 use reqwest::header::HeaderValue;
 use reqwest::header::CONTENT_TYPE;
 use reqwest::header::COOKIE;
-{% if operation.deps is defined and operation.deps | length > 0 %}
-{% if operation.deps | length == 1 %}
-use crate::models::{{ operation.deps | first }};
-{% else %}
-use crate::models::{ {{ operation.deps | join(sep=", ") }} };
-{% endif %}
-{% endif %}
+{% if operation.dep_imports is defined and operation.dep_imports | length > 0 -%}
+{% for imp in operation.dep_imports -%}
+{% if imp.types | length > 1 -%}
+use crate::models::{{ imp.module }}::{% for dep in imp.types %}{{ dep }}{% if not loop.last %}, {% endif %}{% endfor %};
+{%- else -%}
+use crate::models::{{ imp.module }}::{{ imp.types | first }};
+{%- endif -%}
+{%- endfor -%}
+{%- endif %}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum {{ operation.response_enum.name }} {

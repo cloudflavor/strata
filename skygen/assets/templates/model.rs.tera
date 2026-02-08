@@ -15,14 +15,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+{%- if model.dep_imports is defined and model.dep_imports | length > 0 %}
+{%- for imp in model.dep_imports %}
+{%- if imp.types | length > 1 %}
+use crate::models::{{ imp.module }}::{% for dep in imp.types %}{{ dep }}{% if not loop.last %}, {% endif %}{% endfor %};
+{%- else %}
+use crate::models::{{ imp.module }}::{{ imp.types | first }};
+{%- endif %}
+{%- endfor %}
+{%- endif %}
+{%- if model.kind.Struct is defined or model.kind.Composite is defined %}
 use serde::{Deserialize, Serialize};
-{% if model.deps is defined and model.deps | length > 0 %}
-{% if model.deps | length == 1 %}
-use crate::models::{{ model.deps | first }};
-{% else %}
-use crate::models::{ {{ model.deps | join(sep=", ") }} };
-{% endif %}
-{% endif %}
+{%- endif %}
 
 {% if model.kind.Struct is defined %}
 #[derive(Debug, Clone, Serialize, Deserialize)]

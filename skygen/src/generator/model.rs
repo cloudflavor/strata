@@ -16,33 +16,41 @@ use anyhow::{anyhow, Result};
 use indexmap::IndexMap;
 use openapiv3::{AnySchema, OpenAPI, ReferenceOr, Schema, SchemaKind, Type};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Entrypoint for transforming resolved OpenAPI schemas into model definitions.
 #[derive(Debug, Default)]
-pub struct ModelGenerator;
+pub struct ModelGenerator {
+    module_name_map: HashMap<String, String>,
+}
 
 impl ModelGenerator {
     /// Create a new model generator with default settings.
     pub fn new() -> Self {
-        Self
+        Self {
+            module_name_map: HashMap::new(),
+        }
+    }
+
+    pub fn with_module_name_map(module_name_map: HashMap<String, String>) -> Self {
+        Self { module_name_map }
     }
 
     /// Collect model definitions from a resolved OpenAPI document.
     ///
     /// This walks `components.schemas` and converts each schema into an
     /// intermediate `ModelDef` that can later be rendered into Rust code.
-    pub fn collect_models(&self, doc: &OpenAPI) -> Result<ModelRegistry> {
+    pub fn collect_models(&mut self, doc: &OpenAPI) -> Result<ModelRegistry> {
         let mut registry = ModelRegistry::default();
         let Some(components) = doc.components.as_ref() else {
             return Ok(registry);
         };
 
-        let mut module_names = indexmap::IndexSet::new();
+        self.module_name_map = build_component_module_name_map(components.schemas.keys());
+        registry.name_map = self.module_name_map.clone();
 
         for (name, schema) in components.schemas.iter() {
-            let mut def = self.schema_to_model(name, schema)?;
-            def.name = unique_module_name(&def.name, &mut module_names);
+            let def = self.schema_to_model(name, schema)?;
             registry.models.insert(def.name.clone(), def);
         }
 
@@ -59,16 +67,21 @@ impl ModelGenerator {
         let model_type = match schema {
             ReferenceOr::Item(schema) => self.schema_kind_to_model_type(&schema.schema_kind)?,
             ReferenceOr::Reference { reference } => {
-                ModelType::Ref(self.ref_name(reference).unwrap_or(reference).to_string())
+                ModelType::Ref(self.module_name_for_schema(
+                    self.ref_name(reference).unwrap_or(reference),
+                ))
             }
         };
         let render_type = model_type_to_rust(&model_type);
+        let module_name = self.module_name_for_schema(name);
+        let rust_name = sanitize_type_name(&module_name);
 
         Ok(ModelDef {
-            name: sanitize_module_name(name),
-            rust_name: sanitize_type_name(name),
+            name: module_name,
+            rust_name,
             render_type,
             deps: Vec::new(),
+            dep_imports: Vec::new(),
             kind: model_type,
         })
     }
@@ -98,12 +111,17 @@ impl ModelGenerator {
                     render_variants,
                 }))
             }
-            SchemaKind::AllOf { all_of } => {
-                self.all_of_to_struct(all_of, None)
-            }
+            SchemaKind::AllOf { all_of } => self.all_of_to_struct(all_of, None),
             SchemaKind::Not { .. } => Ok(ModelType::Opaque),
             SchemaKind::Any(schema) => self.any_schema_to_model_type(schema),
         }
+    }
+
+    fn module_name_for_schema(&self, name: &str) -> String {
+        self.module_name_map
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| sanitize_module_name(name))
     }
 
     fn hoist_inline_models(&self, registry: &mut ModelRegistry) -> Result<()> {
@@ -159,6 +177,7 @@ impl ModelGenerator {
         }
 
         self.refresh_render_types(registry);
+        self.refresh_type_map(registry);
         self.refresh_deps(registry);
 
         Ok(())
@@ -240,6 +259,7 @@ impl ModelGenerator {
                     rust_name,
                     render_type,
                     deps: Vec::new(),
+                    dep_imports: Vec::new(),
                     kind: ModelType::Struct(ModelStruct {
                         fields: def.fields.clone(),
                     }),
@@ -250,51 +270,50 @@ impl ModelGenerator {
                 *typ = ModelType::Ref(name);
                 Ok(true)
             }
-            ModelType::Array(inner) => {
-                match inner.as_mut() {
-                    ModelType::Struct(def) => {
-                        let sig = struct_signature(def);
-                        if let Some(existing_name) = sig_to_name.get(&sig) {
-                            *inner = Box::new(ModelType::Ref(existing_name.clone()));
-                            return Ok(true);
-                        }
-                        let name = self.inline_model_name(
-                            parent_name,
-                            field_name,
-                            true,
-                            &sig,
-                            existing,
-                            name_to_sig,
-                        );
-                        let rust_name = sanitize_type_name(&name);
-                        let render_type = String::new();
-                        let def = ModelDef {
-                            name: name.clone(),
-                            rust_name,
-                            render_type,
-                            deps: Vec::new(),
-                            kind: ModelType::Struct(ModelStruct {
-                                fields: def.fields.clone(),
-                            }),
-                        };
-                        additions.push((name.clone(), def));
-                        name_to_sig.insert(name.clone(), sig.clone());
-                        sig_to_name.insert(sig, name.clone());
-                        *inner = Box::new(ModelType::Ref(name));
-                        Ok(true)
+            ModelType::Array(inner) => match inner.as_mut() {
+                ModelType::Struct(def) => {
+                    let sig = struct_signature(def);
+                    if let Some(existing_name) = sig_to_name.get(&sig) {
+                        *inner = Box::new(ModelType::Ref(existing_name.clone()));
+                        return Ok(true);
                     }
-                    ModelType::Array(_) => self.hoist_in_type(
+                    let name = self.inline_model_name(
                         parent_name,
                         field_name,
-                        inner.as_mut(),
-                        additions,
+                        true,
+                        &sig,
                         existing,
                         name_to_sig,
-                        sig_to_name,
-                    ),
-                    _ => Ok(false),
+                    );
+                    let rust_name = sanitize_type_name(&name);
+                    let render_type = String::new();
+                    let def = ModelDef {
+                        name: name.clone(),
+                        rust_name,
+                        render_type,
+                        deps: Vec::new(),
+                        dep_imports: Vec::new(),
+                        kind: ModelType::Struct(ModelStruct {
+                            fields: def.fields.clone(),
+                        }),
+                    };
+                    additions.push((name.clone(), def));
+                    name_to_sig.insert(name.clone(), sig.clone());
+                    sig_to_name.insert(sig, name.clone());
+                    *inner = Box::new(ModelType::Ref(name));
+                    Ok(true)
                 }
-            }
+                ModelType::Array(_) => self.hoist_in_type(
+                    parent_name,
+                    field_name,
+                    inner.as_mut(),
+                    additions,
+                    existing,
+                    name_to_sig,
+                    sig_to_name,
+                ),
+                _ => Ok(false),
+            },
             _ => Ok(false),
         }
     }
@@ -330,20 +349,7 @@ impl ModelGenerator {
             return base;
         }
 
-        let mut idx = 2;
-        loop {
-            let candidate = format!("{base}_{idx}");
-            if let Some(existing_sig) = name_to_sig.get(&candidate) {
-                if existing_sig == signature {
-                    return candidate;
-                }
-            }
-            if !existing.contains(&candidate) {
-                existing.insert(candidate.clone());
-                return candidate;
-            }
-            idx += 1;
-        }
+        unique_name_with_hash(&base, signature, existing, name_to_sig)
     }
 
     fn refresh_render_types(&self, registry: &mut ModelRegistry) {
@@ -357,9 +363,19 @@ impl ModelGenerator {
         }
     }
 
+    fn refresh_type_map(&self, registry: &mut ModelRegistry) {
+        registry.type_map = registry
+            .models
+            .values()
+            .map(|model| (model.rust_name.clone(), model.name.clone()))
+            .collect();
+    }
+
     fn refresh_deps(&self, registry: &mut ModelRegistry) {
+        let type_map = registry.type_map.clone();
         for model in registry.models.values_mut() {
             model.deps = collect_model_deps(model);
+            model.dep_imports = group_dep_imports(&model.deps, &type_map);
         }
     }
 
@@ -389,7 +405,7 @@ impl ModelGenerator {
         match schema {
             ReferenceOr::Item(schema) => self.schema_kind_to_model_type(&schema.schema_kind),
             ReferenceOr::Reference { reference } => Ok(ModelType::Ref(
-                self.ref_name(reference).unwrap_or(reference).to_string(),
+                self.module_name_for_schema(self.ref_name(reference).unwrap_or(reference)),
             )),
         }
     }
@@ -399,7 +415,7 @@ impl ModelGenerator {
         match schema {
             ReferenceOr::Item(schema) => self.schema_kind_to_model_type(&schema.schema_kind),
             ReferenceOr::Reference { reference } => Ok(ModelType::Ref(
-                self.ref_name(reference).unwrap_or(reference).to_string(),
+                self.module_name_for_schema(self.ref_name(reference).unwrap_or(reference)),
             )),
         }
     }
@@ -419,10 +435,7 @@ impl ModelGenerator {
             let extra_fields = if schema.properties.is_empty() {
                 None
             } else {
-                Some(self.object_properties_to_fields(
-                    &schema.properties,
-                    &schema.required,
-                )?)
+                Some(self.object_properties_to_fields(&schema.properties, &schema.required)?)
             };
             return self.all_of_to_struct(&schema.all_of, extra_fields);
         }
@@ -486,20 +499,32 @@ impl ModelGenerator {
         extra_fields: Option<Vec<ModelField>>,
     ) -> Result<ModelType> {
         let mut fields = extra_fields.unwrap_or_default();
+        let mut field_index: HashMap<String, usize> = fields
+            .iter()
+            .enumerate()
+            .map(|(idx, field)| (field.name.clone(), idx))
+            .collect();
         let mut part_index = 1;
 
         for schema in all_of {
             let model = self.schema_ref_to_type(schema)?;
             match model {
                 ModelType::Struct(def) => {
-                    fields.extend(def.fields);
+                    for field in def.fields {
+                        if let Some(idx) = field_index.get(&field.name).copied() {
+                            fields[idx] = field;
+                        } else {
+                            field_index.insert(field.name.clone(), fields.len());
+                            fields.push(field);
+                        }
+                    }
                 }
                 other => {
                     let name = format!("part_{}", part_index);
                     part_index += 1;
                     let render_type = model_type_to_rust(&other);
                     let flatten = matches!(other, ModelType::Ref(_));
-                    fields.push(ModelField {
+                    let field = ModelField {
                         name: name.clone(),
                         rust_name: name,
                         required: true,
@@ -507,7 +532,13 @@ impl ModelGenerator {
                         typ: other,
                         render_type,
                         flatten,
-                    });
+                    };
+                    if let Some(idx) = field_index.get(&field.name).copied() {
+                        fields[idx] = field;
+                    } else {
+                        field_index.insert(field.name.clone(), fields.len());
+                        fields.push(field);
+                    }
                 }
             }
         }
@@ -560,11 +591,18 @@ impl ModelGenerator {
 pub struct ModelRegistry {
     /// Map of model name to its definition.
     pub models: IndexMap<String, ModelDef>,
+    /// Map of original schema names to module names.
+    pub name_map: HashMap<String, String>,
+    /// Map of Rust type names to module names.
+    pub type_map: HashMap<String, String>,
 }
 
 impl ModelRegistry {
     /// Return a model by name, if present.
     pub fn get(&self, name: &str) -> Option<&ModelDef> {
+        if let Some(mapped) = self.name_map.get(name) {
+            return self.models.get(mapped);
+        }
         self.models
             .get(name)
             .or_else(|| self.models.get(&sanitize_module_name(name)))
@@ -587,8 +625,17 @@ pub struct ModelDef {
     pub render_type: String,
     /// Other model types referenced by this model.
     pub deps: Vec<String>,
+    /// Renderable imports grouped by module.
+    pub dep_imports: Vec<DepImport>,
     /// The modeled shape.
     pub kind: ModelType,
+}
+
+/// Grouped imports for a module.
+#[derive(Debug, Clone, Serialize)]
+pub struct DepImport {
+    pub module: String,
+    pub types: Vec<String>,
 }
 
 /// The high-level shape of a model.
@@ -795,20 +842,95 @@ fn composite_flavor_name(flavor: CompositeFlavor) -> &'static str {
     }
 }
 
-fn unique_module_name(base: &str, existing: &mut indexmap::IndexSet<String>) -> String {
-    if !existing.contains(base) {
-        existing.insert(base.to_string());
-        return base.to_string();
+fn build_component_module_name_map<'a>(
+    names: impl Iterator<Item = &'a String> + Clone,
+) -> HashMap<String, String> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for name in names.clone() {
+        let base = sanitize_module_name(name);
+        *counts.entry(base).or_insert(0) += 1;
     }
-    let mut idx = 2;
+
+    let mut used: HashSet<String> = HashSet::new();
+    let mut map: HashMap<String, String> = HashMap::new();
+
+    for name in names {
+        let base = sanitize_module_name(name);
+        let resolved = if counts.get(&base).copied().unwrap_or(0) == 1 {
+            base
+        } else {
+            sanitize_module_name_disambiguated(name)
+        };
+        let resolved = ensure_unique_name(resolved, &mut used, name);
+        map.insert(name.clone(), resolved);
+    }
+
+    map
+}
+
+fn ensure_unique_name(name: String, used: &mut HashSet<String>, seed: &str) -> String {
+    if !used.contains(&name) {
+        used.insert(name.clone());
+        return name;
+    }
+
+    let mut attempt = 0usize;
     loop {
-        let candidate = format!("{base}_{idx}");
+        let salt = if attempt == 0 {
+            seed.to_string()
+        } else {
+            format!("{seed}:{attempt}")
+        };
+        let suffix = alpha_hash(&salt);
+        let candidate = format!("{name}_{suffix}");
+        if !used.contains(&candidate) {
+            used.insert(candidate.clone());
+            return candidate;
+        }
+        attempt += 1;
+    }
+}
+
+fn unique_name_with_hash(
+    base: &str,
+    signature: &str,
+    existing: &mut indexmap::IndexSet<String>,
+    name_to_sig: &HashMap<String, String>,
+) -> String {
+    let mut attempt = 0usize;
+    loop {
+        let salt = if attempt == 0 {
+            signature.to_string()
+        } else {
+            format!("{signature}:{attempt}")
+        };
+        let suffix = alpha_hash(&salt);
+        let candidate = format!("{base}_{suffix}");
+        if let Some(existing_sig) = name_to_sig.get(&candidate) {
+            if existing_sig == signature {
+                return candidate;
+            }
+        }
         if !existing.contains(&candidate) {
             existing.insert(candidate.clone());
             return candidate;
         }
-        idx += 1;
+        attempt += 1;
     }
+}
+
+fn alpha_hash(input: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    input.hash(&mut hasher);
+    let mut value = hasher.finish();
+    let mut out = String::new();
+    for _ in 0..6 {
+        let idx = (value % 26) as u8;
+        out.push((b'a' + idx) as char);
+        value /= 26;
+    }
+    out
 }
 
 fn collect_model_deps(model: &ModelDef) -> Vec<String> {
@@ -817,6 +939,27 @@ fn collect_model_deps(model: &ModelDef) -> Vec<String> {
     deps.shift_remove(&model.rust_name);
     let mut out: Vec<String> = deps.into_iter().collect();
     out.sort();
+    out
+}
+
+pub fn group_dep_imports(
+    deps: &[String],
+    type_map: &HashMap<String, String>,
+) -> Vec<DepImport> {
+    let mut grouped: IndexMap<String, Vec<String>> = IndexMap::new();
+    for dep in deps {
+        let module = type_map
+            .get(dep)
+            .cloned()
+            .unwrap_or_else(|| sanitize_module_name(dep));
+        grouped.entry(module).or_default().push(dep.clone());
+    }
+
+    let mut out: Vec<DepImport> = grouped
+        .into_iter()
+        .map(|(module, types)| DepImport { module, types })
+        .collect();
+    out.sort_by(|a, b| a.module.cmp(&b.module));
     out
 }
 
@@ -885,6 +1028,42 @@ pub fn sanitize_module_name(name: &str) -> String {
     }
 }
 
+fn sanitize_module_name_disambiguated(name: &str) -> String {
+    let mut out = String::new();
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            continue;
+        }
+
+        if !out.ends_with('_') && !out.is_empty() {
+            out.push('_');
+        }
+        out.push_str(match ch {
+            '-' => "dash",
+            '_' => "underscore",
+            '.' => "dot",
+            '/' => "slash",
+            ':' => "colon",
+            '+' => "plus",
+            '@' => "at",
+            ' ' => "space",
+            _ => "sep",
+        });
+        out.push('_');
+    }
+
+    if out.ends_with('_') {
+        out.pop();
+    }
+
+    if out.is_empty() {
+        "_".into()
+    } else {
+        out
+    }
+}
+
 /// Sanitize a schema property name into a Rust field identifier.
 pub fn sanitize_field_name(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
@@ -911,8 +1090,7 @@ pub fn sanitize_field_name(name: &str) -> String {
 fn is_rust_keyword(ident: &str) -> bool {
     matches!(
         ident,
-        "as"
-            | "break"
+        "as" | "break"
             | "const"
             | "continue"
             | "crate"
@@ -1028,7 +1206,7 @@ mod tests {
             }),
         );
 
-        let generator = ModelGenerator::new();
+        let mut generator = ModelGenerator::new();
         let registry = generator.collect_models(&doc).expect("collect");
         let user = registry.get("User").expect("user model");
         let ModelType::Struct(def) = &user.kind else {
@@ -1062,7 +1240,7 @@ mod tests {
             }),
         );
 
-        let generator = ModelGenerator::new();
+        let mut generator = ModelGenerator::new();
         let registry = generator.collect_models(&doc).expect("collect");
         let tags = registry.get("Tags").expect("tags model");
         let ModelType::Array(inner) = &tags.kind else {
@@ -1114,7 +1292,7 @@ mod tests {
             }),
         );
 
-        let generator = ModelGenerator::new();
+        let mut generator = ModelGenerator::new();
         let registry = generator.collect_models(&doc).expect("collect");
         let container = registry.get("container").expect("container model");
         let ModelType::Struct(def) = &container.kind else {
@@ -1150,7 +1328,7 @@ mod tests {
             },
         );
 
-        let generator = ModelGenerator::new();
+        let mut generator = ModelGenerator::new();
         let registry = generator.collect_models(&doc).expect("collect");
         let user = registry.get("User").expect("user model");
         let ModelType::Ref(name) = &user.kind else {
@@ -1180,7 +1358,7 @@ mod tests {
             }),
         );
 
-        let generator = ModelGenerator::new();
+        let mut generator = ModelGenerator::new();
         let registry = generator.collect_models(&doc).expect("collect");
         let model = registry.get("aaa_api-response").expect("model");
         assert_eq!(model.name, "aaa_api_response");
@@ -1212,7 +1390,7 @@ mod tests {
             }),
         );
 
-        let generator = ModelGenerator::new();
+        let mut generator = ModelGenerator::new();
         let registry = generator.collect_models(&doc).expect("collect");
         let container = registry.get("Container").expect("container");
         assert_eq!(container.deps, vec!["Widget"]);
@@ -1223,6 +1401,49 @@ mod tests {
         assert_eq!(sanitize_field_name("type"), "type_");
         assert_eq!(sanitize_field_name("user-id"), "user_id");
         assert_eq!(sanitize_field_name("123name"), "_123name");
+    }
+
+    #[test]
+    fn test_import_naming_consistency() {
+        // This test verifies that model dependencies are correctly named for imports
+        // The key issue is that dependencies should be PascalCase for import statements
+        // but module names should be snake_case
+        let mut doc = make_doc();
+        let components = doc.components.as_mut().unwrap();
+        components.schemas.insert(
+            "Widget".into(),
+            ReferenceOr::Item(Schema {
+                schema_data: Default::default(),
+                schema_kind: SchemaKind::Type(Type::String(Default::default())),
+            }),
+        );
+        let mut container = openapiv3::ObjectType::default();
+        container.properties.insert(
+            "widget".into(),
+            ReferenceOr::Reference {
+                reference: "#/components/schemas/Widget".into(),
+            },
+        );
+        components.schemas.insert(
+            "Container".into(),
+            ReferenceOr::Item(Schema {
+                schema_data: Default::default(),
+                schema_kind: SchemaKind::Type(Type::Object(container)),
+            }),
+        );
+
+        let mut generator = ModelGenerator::new();
+        let registry = generator.collect_models(&doc).expect("collect");
+        let container = registry.get("Container").expect("container");
+        // This should pass - the dependency should be "Widget" (PascalCase) not "widget" (snake_case)
+        // This test is checking that the dependency collection is working correctly
+        // The actual issue is in operation dependencies, not model dependencies
+        println!("Container deps: {:?}", container.deps);
+        // The model key is now "widget" due to module name sanitization
+        let widget_model = registry.models.get("widget").unwrap();
+        println!("Widget model name: {:?}", widget_model.name);
+        println!("Widget model rust_name: {:?}", widget_model.rust_name);
+        assert_eq!(container.deps, vec!["Widget"]);
     }
 
     #[test]
@@ -1247,7 +1468,7 @@ mod tests {
             }),
         );
 
-        let generator = ModelGenerator::new();
+        let mut generator = ModelGenerator::new();
         let registry = generator.collect_models(&doc).expect("collect");
         let scalar = registry.get("Scalar").expect("scalar model");
         let ModelType::Composite(comp) = &scalar.kind else {
@@ -1325,7 +1546,7 @@ mod tests {
             }),
         );
 
-        let generator = ModelGenerator::new();
+        let mut generator = ModelGenerator::new();
         let registry = generator.collect_models(&doc).expect("collect");
         let collection = registry.get("Collection").expect("collection model");
         let ModelType::Struct(def) = &collection.kind else {
@@ -1404,7 +1625,7 @@ mod tests {
             }),
         );
 
-        let generator = ModelGenerator::new();
+        let mut generator = ModelGenerator::new();
         let registry = generator.collect_models(&doc).expect("collect");
         let collection = registry.get("Collection").expect("collection model");
         let ModelType::Struct(def) = &collection.kind else {
@@ -1436,7 +1657,7 @@ mod tests {
             }),
         );
 
-        let generator = ModelGenerator::new();
+        let mut generator = ModelGenerator::new();
         let registry = generator.collect_models(&doc).expect("collect");
         let note = registry.get("Note").expect("note model");
         let ModelType::Struct(def) = &note.kind else {
@@ -1468,7 +1689,7 @@ mod tests {
             }),
         );
 
-        let generator = ModelGenerator::new();
+        let mut generator = ModelGenerator::new();
         let registry = generator.collect_models(&doc).expect("collect");
         let note = registry.get("Note").expect("note model");
         let ModelType::Struct(def) = &note.kind else {
