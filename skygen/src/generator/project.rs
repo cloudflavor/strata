@@ -19,8 +19,9 @@ use anyhow::{Context, Result};
 use indexmap::IndexMap;
 use std::path::Path;
 use std::process::Command;
+use std::collections::HashSet;
 use taplo::formatter;
-use tera::{Context as TeraContext, Tera};
+use tera::{Context as TeraContext, Tera, Value};
 use tokio::fs;
 
 #[derive(Debug)]
@@ -50,7 +51,11 @@ pub fn render_project_templates(
 }
 
 // Separated file writing logic for easier testing
-pub async fn write_project_files(root: &Path, plans: &[RenderPlan], rendered_data: &[String]) -> Result<()> {
+pub async fn write_project_files(
+    root: &Path,
+    plans: &[RenderPlan],
+    rendered_data: &[String],
+) -> Result<()> {
     for (p, data) in plans.iter().zip(rendered_data.iter()) {
         // NOTE: avoid using the taplo CLI for formatting the Cargo.toml file after tera rendering
         let out = root.join(&p.out_rel);
@@ -97,6 +102,7 @@ pub async fn bootstrap_lib(
         "templates/cargo.toml.tera",
         "templates/operation.rs.tera",
         "templates/model.rs.tera",
+        "templates/aliases.rs.tera",
         "templates/lib.rs.tera",
         "templates/mod.rs.tera",
     ];
@@ -151,19 +157,62 @@ pub async fn bootstrap_lib(
 
     // Generate model files
     let mut models: Vec<RenderPlan> = Vec::new();
-    let mut mods = Vec::new();
+    let mut mods: Vec<String> = Vec::new();
+    let type_map = registry.type_map.clone();
+    let mut alias_models = Vec::new();
 
     for (name, model) in registry.models.into_iter() {
-        mods.push(name.clone());
-        let mut model_ctx = TeraContext::new();
-        let out_file = format!("src/models/{name}.rs");
-        model_ctx.insert("model", &model);
+        match model.kind {
+            crate::generator::model::ModelType::Struct(_)
+            | crate::generator::model::ModelType::Composite(_) => {
+                mods.push(name.clone());
+                let mut model_ctx = TeraContext::new();
+                let out_file = format!("src/models/{name}.rs");
+                model_ctx.insert("model", &model);
 
+                models.push(RenderPlan {
+                    template: "templates/model.rs.tera",
+                    out_rel: out_file,
+                    extra_ctx: Some(model_ctx),
+                });
+            }
+            _ => {
+                alias_models.push(model);
+            }
+        }
+    }
+
+    if !alias_models.is_empty() {
+        let mut alias_module = "aliases".to_string();
+        if mods.iter().any(|name| name == &alias_module) {
+            alias_module = "model_aliases".to_string();
+        }
+        if mods.iter().any(|name| name == &alias_module) {
+            alias_module = "type_aliases".to_string();
+        }
+
+        let mut alias_ctx = TeraContext::new();
+        alias_ctx.insert("aliases", &alias_models);
+
+        let mut alias_deps = indexmap::IndexSet::new();
+        for model in &alias_models {
+            for dep in &model.deps {
+                alias_deps.insert(dep.clone());
+            }
+        }
+        let mut alias_deps: Vec<String> = alias_deps.into_iter().collect();
+        alias_deps.sort();
+        let dep_imports =
+            crate::generator::model::group_dep_imports(&alias_deps, &type_map);
+        alias_ctx.insert("dep_imports", &dep_imports);
+
+        let out_file = format!("src/models/{alias_module}.rs");
         models.push(RenderPlan {
-            template: "templates/model.rs.tera",
+            template: "templates/aliases.rs.tera",
             out_rel: out_file,
-            extra_ctx: Some(model_ctx),
+            extra_ctx: Some(alias_ctx),
         });
+        mods.push(alias_module);
     }
 
     // Add module context for models
@@ -178,13 +227,14 @@ pub async fn bootstrap_lib(
 
     let models_ctx = TeraContext::new();
     let rendered_model_data = render_project_templates(&tera, &models_ctx, &models)?;
+    clean_stale_model_files(out_dir.as_ref(), &models).await?;
     write_project_files(out_dir.as_ref(), &models, &rendered_model_data).await?;
 
     // Generate operation files
     let mut ops_plans: Vec<RenderPlan> = Vec::new();
     let mut groups: IndexMap<String, Vec<String>> = IndexMap::new();
 
-    for (name, op) in ops.ops.into_iter() {
+    for (name, op) in ops.ops.iter() {
         let group = op.group.clone();
         groups.entry(group.clone()).or_default().push(name.clone());
 
@@ -229,6 +279,10 @@ pub async fn bootstrap_lib(
 /// Load a Tera instance populated with embedded template assets.
 pub fn load_templates(names: &[&str]) -> Result<Tera> {
     let mut tera = Tera::default();
+
+    // Register custom filters
+    tera.register_filter("sanitize_module_name", sanitize_module_name_filter);
+
     for name in names {
         let f = crate::ASSETS
             .get_file(*name)
@@ -243,11 +297,62 @@ pub fn load_templates(names: &[&str]) -> Result<Tera> {
     Ok(tera)
 }
 
+/// Filter to sanitize module names for use in Rust imports
+fn sanitize_module_name_filter(
+    value: &Value,
+    _args: &std::collections::HashMap<String, Value>,
+) -> tera::Result<Value> {
+    if let Some(s) = value.as_str() {
+        // This is a simplified version of the sanitize_module_name function
+        // from the model.rs file
+        let mut out = String::with_capacity(s.len());
+        for ch in s.chars() {
+            if ch.is_ascii_alphanumeric() {
+                out.push(ch.to_ascii_lowercase());
+            } else {
+                out.push('_');
+            }
+        }
+        if out.is_empty() {
+            out = "_".to_string();
+        }
+        Ok(Value::String(out))
+    } else {
+        // If value is not a string, return it as is
+        Ok(value.clone())
+    }
+}
+
 async fn create_dirs(root_dir: &Path) -> Result<()> {
     let src_dir = root_dir.join("src");
 
     for path in [&src_dir, &src_dir.join("apis"), &src_dir.join("models")] {
         fs::create_dir_all(path).await?;
+    }
+
+    Ok(())
+}
+
+async fn clean_stale_model_files(root: &Path, plans: &[RenderPlan]) -> Result<()> {
+    let models_dir = root.join("src/models");
+    if !models_dir.exists() {
+        return Ok(());
+    }
+
+    let mut desired: HashSet<std::path::PathBuf> = HashSet::new();
+    for plan in plans {
+        desired.insert(root.join(&plan.out_rel));
+    }
+
+    let mut entries = fs::read_dir(&models_dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+            continue;
+        }
+        if !desired.contains(&path) {
+            fs::remove_file(path).await?;
+        }
     }
 
     Ok(())
@@ -301,6 +406,7 @@ mod tests {
                 has_default: false,
             },
             deps: Vec::new(),
+            dep_imports: Vec::new(),
             group: "default".into(),
             params: vec![OperationParam {
                 name: "id".into(),
