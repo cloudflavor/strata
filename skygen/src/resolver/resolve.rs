@@ -134,7 +134,10 @@ impl Resolver {
 
     /// Iterate over every schema entry and resolve the referenced
     /// structure (tracking progress to avoid borrowing issues).
-    fn resolve_schema_map(&mut self, schemas: &mut IndexMap<String, ReferenceOr<Schema>>) -> Result<()> {
+    fn resolve_schema_map(
+        &mut self,
+        schemas: &mut IndexMap<String, ReferenceOr<Schema>>,
+    ) -> Result<()> {
         let names: Vec<String> = schemas.keys().cloned().collect();
         for name in names {
             let entry = schemas
@@ -199,12 +202,9 @@ impl Resolver {
         examples: &mut IndexMap<String, ReferenceOr<Example>>,
         cache: &mut HashMap<String, Example>,
     ) -> Result<()> {
-        self.resolve_component_map(
-            examples,
-            cache,
-            "#/components/examples/",
-            |_, example| Self::noop_walk(example),
-        )
+        self.resolve_component_map(examples, cache, "#/components/examples/", |_, example| {
+            Self::noop_walk(example)
+        })
     }
 
     fn resolve_request_body_map(
@@ -253,12 +253,9 @@ impl Resolver {
         links: &mut IndexMap<String, ReferenceOr<Link>>,
         cache: &mut HashMap<String, Link>,
     ) -> Result<()> {
-        self.resolve_component_map(
-            links,
-            cache,
-            "#/components/links/",
-            |_, link| Self::noop_walk(link),
-        )
+        self.resolve_component_map(links, cache, "#/components/links/", |_, link| {
+            Self::noop_walk(link)
+        })
     }
 
     fn resolve_callback_map(
@@ -349,13 +346,9 @@ impl Resolver {
                     walk_inline(self, &mut item)?;
                     item
                 }
-                ReferenceOr::Reference { reference: nested } => self.resolve_component_reference(
-                    map,
-                    cache,
-                    prefix,
-                    &nested,
-                    walk_inline,
-                )?,
+                ReferenceOr::Reference { reference: nested } => {
+                    self.resolve_component_reference(map, cache, prefix, &nested, walk_inline)?
+                }
             };
 
             cache.insert(target.to_string(), resolved.clone());
@@ -426,7 +419,11 @@ impl Resolver {
         Ok(resolved)
     }
 
-    fn resolve_path_item(&mut self, item: &mut PathItem, components: &mut Components) -> Result<()> {
+    fn resolve_path_item(
+        &mut self,
+        item: &mut PathItem,
+        components: &mut Components,
+    ) -> Result<()> {
         self.resolve_parameters(&mut item.parameters, components)?;
         if let Some(operation) = item.get.as_mut() {
             self.resolve_operation(operation, components)?;
@@ -789,8 +786,7 @@ impl Resolver {
                 }
             };
 
-            self.link_cache
-                .insert(target.to_string(), resolved.clone());
+            self.link_cache.insert(target.to_string(), resolved.clone());
             Ok(resolved)
         })();
 
@@ -886,7 +882,8 @@ impl Resolver {
                 }
             };
 
-            self.schema_cache.insert(target.to_string(), resolved.clone());
+            self.schema_cache
+                .insert(target.to_string(), resolved.clone());
             Ok(resolved)
         })();
 
@@ -1083,7 +1080,11 @@ impl Resolver {
         Ok(())
     }
 
-    fn walk_parameter(&mut self, parameter: &mut Parameter, components: &mut Components) -> Result<()> {
+    fn walk_parameter(
+        &mut self,
+        parameter: &mut Parameter,
+        components: &mut Components,
+    ) -> Result<()> {
         let data = match parameter {
             Parameter::Query { parameter_data, .. } => parameter_data,
             Parameter::Header { parameter_data, .. } => parameter_data,
@@ -1142,7 +1143,11 @@ impl Resolver {
         Ok(())
     }
 
-    fn walk_response(&mut self, response: &mut Response, components: &mut Components) -> Result<()> {
+    fn walk_response(
+        &mut self,
+        response: &mut Response,
+        components: &mut Components,
+    ) -> Result<()> {
         for header in response.headers.values_mut() {
             self.resolve_header_ref(header, components)?;
         }
@@ -1155,7 +1160,11 @@ impl Resolver {
         Ok(())
     }
 
-    fn walk_media_type(&mut self, media: &mut MediaType, components: &mut Components) -> Result<()> {
+    fn walk_media_type(
+        &mut self,
+        media: &mut MediaType,
+        components: &mut Components,
+    ) -> Result<()> {
         if let Some(schema_ref) = media.schema.as_mut() {
             self.resolve_schema_ref(schema_ref, &mut components.schemas)?;
         }
@@ -1170,7 +1179,11 @@ impl Resolver {
         Ok(())
     }
 
-    fn walk_callback(&mut self, callback: &mut Callback, components: &mut Components) -> Result<()> {
+    fn walk_callback(
+        &mut self,
+        callback: &mut Callback,
+        components: &mut Components,
+    ) -> Result<()> {
         for item in callback.values_mut() {
             self.resolve_path_item(item, components)?;
         }
@@ -1180,7 +1193,6 @@ impl Resolver {
     fn decode_pointer_segment(segment: &str) -> String {
         segment.replace("~1", "/").replace("~0", "~")
     }
-
 
     fn noop_walk<T>(_: &mut T) -> Result<()> {
         Ok(())
@@ -1491,10 +1503,7 @@ mod tests {
         let mut doc = base_openapi();
         let components = doc.components.as_mut().unwrap();
         let mut callback: Callback = IndexMap::new();
-        callback.insert(
-            "{$request.body#/callback}".into(),
-            PathItem::default(),
-        );
+        callback.insert("{$request.body#/callback}".into(), PathItem::default());
         components
             .callbacks
             .insert("Webhook".into(), ReferenceOr::Item(callback));
@@ -1594,7 +1603,12 @@ mod tests {
             }
         }
 
-        let response = match operation.responses.responses.get(&StatusCode::Code(200)).unwrap() {
+        let response = match operation
+            .responses
+            .responses
+            .get(&StatusCode::Code(200))
+            .unwrap()
+        {
             ReferenceOr::Item(response) => response,
             ReferenceOr::Reference { reference } => {
                 panic!("expected resolved response, found reference {reference}")
@@ -1844,10 +1858,9 @@ mod tests {
         response.content.insert("application/json".into(), media);
 
         let mut op = Operation::default();
-        op.responses.responses.insert(
-            StatusCode::Code(200),
-            ReferenceOr::Item(response),
-        );
+        op.responses
+            .responses
+            .insert(StatusCode::Code(200), ReferenceOr::Item(response));
 
         let mut item = PathItem::default();
         item.get = Some(op);
