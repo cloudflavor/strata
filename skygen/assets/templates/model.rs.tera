@@ -26,6 +26,9 @@ use crate::models::{{ imp.module }}::{{ imp.types | first }};
 {%- endif %}
 {%- if model.kind.Struct is defined or model.kind.Composite is defined %}
 use serde::{Deserialize, Serialize};
+{%- if model.kind.Composite is defined and model.kind.Composite.flavor != "AllOf" %}
+use serde_json::Value as SerdeJsonValue;
+{%- endif %}
 {%- endif %}
 
 {% if model.kind.Struct is defined %}
@@ -46,12 +49,15 @@ pub struct {{ model.rust_name | default(value=model.name) }} {
 {% endfor %}
 }
 {% else %}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum {{ model.rust_name | default(value=model.name) }} {
-{% for variant in model.kind.Composite.render_variants %}
-    Variant{{ loop.index }}({{ variant }}),
-{% endfor %}
-}
+crate::serde_union!(
+    {{ model.rust_name | default(value=model.name) }},
+    {{ model.rust_name | default(value=model.name) }}Match,
+    [
+{%- for variant in model.kind.Composite.render_variants %}
+        Variant{{ loop.index }}: {{ variant }}{% if not loop.last %},{% endif %}
+{%- endfor %}
+    ]
+);
 {% endif %}
 {% else %}
 pub type {{ model.rust_name | default(value=model.name) }} = {{ model.render_type | default(value="serde_json::Value") }};
