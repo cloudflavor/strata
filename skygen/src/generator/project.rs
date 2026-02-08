@@ -16,10 +16,10 @@ use crate::generator::model::ModelRegistry;
 use crate::generator::operation::OperationRegistry;
 use crate::Config;
 use anyhow::{Context, Result};
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
+use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
-use std::collections::HashSet;
 use taplo::formatter;
 use tera::{Context as TeraContext, Tera, Value};
 use tokio::fs;
@@ -100,7 +100,7 @@ pub async fn bootstrap_lib(
     // Load templates
     let template_names = [
         "templates/cargo.toml.tera",
-        "templates/operation.rs.tera",
+        "templates/operations.rs.tera",
         "templates/model.rs.tera",
         "templates/aliases.rs.tera",
         "templates/lib.rs.tera",
@@ -259,33 +259,58 @@ pub async fn bootstrap_lib(
     clean_stale_model_files(out_dir.as_ref(), &models).await?;
     write_project_files(out_dir.as_ref(), &models, &rendered_model_data).await?;
 
-    // Generate operation files
+    // Generate grouped operation files
     let mut ops_plans: Vec<RenderPlan> = Vec::new();
-    let mut groups: IndexMap<String, Vec<String>> = IndexMap::new();
+    let mut groups: IndexMap<String, Vec<crate::generator::operation::OperationDef>> =
+        IndexMap::new();
 
-    for (name, op) in ops.ops.iter() {
-        let group = op.group.clone();
-        groups.entry(group.clone()).or_default().push(name.clone());
-
-        let mut op_ctx = TeraContext::new();
-        let out_file = format!("src/apis/{group}/{name}.rs");
-        op_ctx.insert("operation", &op);
-
-        ops_plans.push(RenderPlan {
-            template: "templates/operation.rs.tera",
-            out_rel: out_file,
-            extra_ctx: Some(op_ctx),
-        });
+    for op in ops.ops.values() {
+        groups.entry(op.group.clone()).or_default().push(op.clone());
     }
 
     let mut top_modules: Vec<String> = Vec::new();
-    for (group, ops) in groups.iter() {
+    for (group, group_ops) in groups.iter() {
         top_modules.push(group.clone());
+
+        let mut deps: IndexSet<String> = IndexSet::new();
+        let mut uses_header_value = false;
+        let mut uses_cookie_header = false;
+        let mut uses_content_type = false;
+        let mut uses_error_types = false;
+
+        for op in group_ops {
+            for dep in &op.deps {
+                deps.insert(dep.clone());
+            }
+            if op.has_header_params || op.has_cookie_params || op.request_body.is_some() {
+                uses_header_value = true;
+            }
+            if op.has_cookie_params {
+                uses_cookie_header = true;
+            }
+            if op.request_body.is_some() {
+                uses_content_type = true;
+            }
+            if !op.response_enum.has_default {
+                uses_error_types = true;
+            }
+        }
+
+        let mut deps_vec: Vec<String> = deps.into_iter().collect();
+        deps_vec.sort();
+        let dep_imports = crate::generator::model::group_dep_imports(&deps_vec, &type_map);
+
         let mut group_ctx = TeraContext::new();
-        group_ctx.insert("modules", ops);
+        group_ctx.insert("operations", group_ops);
+        group_ctx.insert("dep_imports", &dep_imports);
+        group_ctx.insert("uses_header_value", &uses_header_value);
+        group_ctx.insert("uses_cookie_header", &uses_cookie_header);
+        group_ctx.insert("uses_content_type", &uses_content_type);
+        group_ctx.insert("uses_error_types", &uses_error_types);
+
         ops_plans.push(RenderPlan {
-            template: "templates/mod.rs.tera",
-            out_rel: format!("src/apis/{group}/mod.rs"),
+            template: "templates/operations.rs.tera",
+            out_rel: format!("src/apis/{group}.rs"),
             extra_ctx: Some(group_ctx),
         });
     }
@@ -300,6 +325,7 @@ pub async fn bootstrap_lib(
 
     let ops_ctx = TeraContext::new();
     let rendered_ops_data = render_project_templates(&tera, &ops_ctx, &ops_plans)?;
+    clean_stale_api_files(out_dir.as_ref(), &ops_plans).await?;
     write_project_files(out_dir.as_ref(), &ops_plans, &rendered_ops_data).await?;
 
     Ok(())
@@ -387,6 +413,69 @@ async fn clean_stale_model_files(root: &Path, plans: &[RenderPlan]) -> Result<()
     Ok(())
 }
 
+async fn clean_stale_api_files(root: &Path, plans: &[RenderPlan]) -> Result<()> {
+    let apis_dir = root.join("src/apis");
+    if !apis_dir.exists() {
+        return Ok(());
+    }
+
+    let mut desired: HashSet<std::path::PathBuf> = HashSet::new();
+    for plan in plans {
+        desired.insert(root.join(&plan.out_rel));
+    }
+
+    let mut stack = vec![apis_dir.clone()];
+    while let Some(dir) = stack.pop() {
+        let mut entries = fs::read_dir(&dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            let file_type = entry.file_type().await?;
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                continue;
+            }
+            if !desired.contains(&path) {
+                fs::remove_file(path).await?;
+            }
+        }
+    }
+
+    remove_empty_api_dirs(&apis_dir).await?;
+
+    Ok(())
+}
+
+async fn remove_empty_api_dirs(root: &Path) -> Result<()> {
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        dirs.push(dir.clone());
+        let mut entries = fs::read_dir(&dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            if entry.file_type().await?.is_dir() {
+                stack.push(entry.path());
+            }
+        }
+    }
+
+    dirs.sort_by_key(|dir| std::cmp::Reverse(dir.components().count()));
+    for dir in dirs {
+        if dir == root {
+            continue;
+        }
+        let mut entries = fs::read_dir(&dir).await?;
+        if entries.next_entry().await?.is_none() {
+            fs::remove_dir(&dir).await?;
+        }
+    }
+
+    Ok(())
+}
+
 pub fn format_crate(path: &Path) -> Result<()> {
     Command::new("cargo")
         .arg("fmt")
@@ -409,7 +498,7 @@ mod tests {
 
     #[test]
     fn renders_operation_template_with_client() {
-        let tera = load_templates(&["templates/operation.rs.tera"]).expect("templates");
+        let tera = load_templates(&["templates/operations.rs.tera"]).expect("templates");
         let mut ctx = TeraContext::new();
         let operation = OperationDef {
             id: "get_test".into(),
@@ -444,11 +533,22 @@ mod tests {
                 required: true,
                 typ: ModelType::Primitive(PrimitiveType::String),
                 render_type: "String".into(),
+                is_array: false,
+                array_item_is_primitive: false,
             }],
+            has_path_params: true,
+            has_query_params: false,
+            has_header_params: false,
+            has_cookie_params: false,
         };
-        ctx.insert("operation", &operation);
+        ctx.insert("operations", &vec![operation]);
+        ctx.insert("dep_imports", &Vec::<crate::generator::model::DepImport>::new());
+        ctx.insert("uses_header_value", &false);
+        ctx.insert("uses_cookie_header", &false);
+        ctx.insert("uses_content_type", &false);
+        ctx.insert("uses_error_types", &true);
         let data = tera
-            .render("templates/operation.rs.tera", &ctx)
+            .render("templates/operations.rs.tera", &ctx)
             .expect("render");
         assert!(data.contains("client: &Client"));
         assert!(data.contains("parse_response"));

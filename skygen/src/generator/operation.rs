@@ -23,6 +23,7 @@ use openapiv3::{
     RequestBody, Response, StatusCode,
 };
 use serde::Serialize;
+use std::collections::HashSet;
 
 #[derive(Debug, Default)]
 pub struct OperationGenerator;
@@ -121,14 +122,27 @@ impl OperationGenerator {
             dep_imports: Vec::new(),
             group: sanitize_module_name(op.tags.first().map(|s| s.as_str()).unwrap_or("default")),
             params: Vec::new(),
+            has_path_params: false,
+            has_query_params: false,
+            has_header_params: false,
+            has_cookie_params: false,
         };
 
         let model_gen = ModelGenerator::with_module_name_map(models.name_map.clone());
 
         def.params = collect_parameters(
             &model_gen,
+            models,
             item.parameters.iter().chain(op.parameters.iter()),
         );
+        for param in &def.params {
+            match param.location {
+                OperationParamLocation::Path => def.has_path_params = true,
+                OperationParamLocation::Query => def.has_query_params = true,
+                OperationParamLocation::Header => def.has_header_params = true,
+                OperationParamLocation::Cookie => def.has_cookie_params = true,
+            }
+        }
 
         if let Some(body) = op.request_body.as_ref() {
             if let Ok(Some(body)) = request_body_to_type(&model_gen, body) {
@@ -173,6 +187,10 @@ pub struct OperationDef {
     pub dep_imports: Vec<DepImport>,
     pub group: String,
     pub params: Vec<OperationParam>,
+    pub has_path_params: bool,
+    pub has_query_params: bool,
+    pub has_header_params: bool,
+    pub has_cookie_params: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -183,9 +201,11 @@ pub struct OperationParam {
     pub required: bool,
     pub typ: ModelType,
     pub render_type: String,
+    pub is_array: bool,
+    pub array_item_is_primitive: bool,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Hash)]
 pub enum OperationParamLocation {
     Path,
     Query,
@@ -409,15 +429,29 @@ fn collect_deps_from_type(typ: &ModelType, deps: &mut indexmap::IndexSet<String>
         ModelType::Ref(name) => {
             deps.insert(sanitize_type_name(name));
         }
-        ModelType::Array(inner) => collect_deps_from_type(inner, deps),
+        ModelType::Array(inner) => {
+            if model_type_to_rust(inner) != "serde_json::Value" {
+                collect_deps_from_type(inner, deps);
+            }
+        }
         ModelType::Struct(def) => {
+            if model_type_to_rust(typ) == "serde_json::Value" {
+                return;
+            }
             for field in &def.fields {
-                collect_deps_from_type(&field.typ, deps);
+                if model_type_to_rust(&field.typ) != "serde_json::Value" {
+                    collect_deps_from_type(&field.typ, deps);
+                }
             }
         }
         ModelType::Composite(comp) => {
+            if model_type_to_rust(typ) == "serde_json::Value" {
+                return;
+            }
             for variant in &comp.variants {
-                collect_deps_from_type(variant, deps);
+                if model_type_to_rust(variant) != "serde_json::Value" {
+                    collect_deps_from_type(variant, deps);
+                }
             }
         }
         ModelType::Primitive(_) | ModelType::Opaque => {}
@@ -426,9 +460,11 @@ fn collect_deps_from_type(typ: &ModelType, deps: &mut indexmap::IndexSet<String>
 
 fn collect_parameters<'a>(
     generator: &ModelGenerator,
+    models: &ModelRegistry,
     params: impl Iterator<Item = &'a ReferenceOr<Parameter>>,
 ) -> Vec<OperationParam> {
     let mut out = Vec::new();
+    let mut seen: std::collections::HashSet<(OperationParamLocation, String)> = HashSet::new();
 
     for param in params {
         let param = match param {
@@ -440,31 +476,55 @@ fn collect_parameters<'a>(
 
         match param {
             Parameter::Query { parameter_data, .. } => {
-                if let Some(param) =
-                    parameter_to_param(generator, parameter_data, OperationParamLocation::Query)
-                {
-                    out.push(param);
+                if let Some(param) = parameter_to_param(
+                    generator,
+                    models,
+                    parameter_data,
+                    OperationParamLocation::Query,
+                ) {
+                    let key = (param.location, param.name.clone());
+                    if seen.insert(key) {
+                        out.push(param);
+                    }
                 }
             }
             Parameter::Header { parameter_data, .. } => {
-                if let Some(param) =
-                    parameter_to_param(generator, parameter_data, OperationParamLocation::Header)
-                {
-                    out.push(param);
+                if let Some(param) = parameter_to_param(
+                    generator,
+                    models,
+                    parameter_data,
+                    OperationParamLocation::Header,
+                ) {
+                    let key = (param.location, param.name.clone());
+                    if seen.insert(key) {
+                        out.push(param);
+                    }
                 }
             }
             Parameter::Path { parameter_data, .. } => {
-                if let Some(param) =
-                    parameter_to_param(generator, parameter_data, OperationParamLocation::Path)
-                {
-                    out.push(param);
+                if let Some(param) = parameter_to_param(
+                    generator,
+                    models,
+                    parameter_data,
+                    OperationParamLocation::Path,
+                ) {
+                    let key = (param.location, param.name.clone());
+                    if seen.insert(key) {
+                        out.push(param);
+                    }
                 }
             }
             Parameter::Cookie { parameter_data, .. } => {
-                if let Some(param) =
-                    parameter_to_param(generator, parameter_data, OperationParamLocation::Cookie)
-                {
-                    out.push(param);
+                if let Some(param) = parameter_to_param(
+                    generator,
+                    models,
+                    parameter_data,
+                    OperationParamLocation::Cookie,
+                ) {
+                    let key = (param.location, param.name.clone());
+                    if seen.insert(key) {
+                        out.push(param);
+                    }
                 }
             }
         }
@@ -475,6 +535,7 @@ fn collect_parameters<'a>(
 
 fn parameter_to_param(
     generator: &ModelGenerator,
+    models: &ModelRegistry,
     data: &openapiv3::ParameterData,
     location: OperationParamLocation,
 ) -> Option<OperationParam> {
@@ -494,6 +555,8 @@ fn parameter_to_param(
         }
     };
 
+    let (is_array, array_item_is_primitive) = param_type_meta(&typ, models);
+
     Some(OperationParam {
         name: data.name.clone(),
         rust_name: sanitize_field_name(&data.name),
@@ -501,7 +564,27 @@ fn parameter_to_param(
         required: data.required || matches!(location, OperationParamLocation::Path),
         typ,
         render_type,
+        is_array,
+        array_item_is_primitive,
     })
+}
+
+fn param_type_meta(typ: &ModelType, models: &ModelRegistry) -> (bool, bool) {
+    match typ {
+        ModelType::Array(inner) => (true, is_display_type(inner, models)),
+        _ => (false, false),
+    }
+}
+
+fn is_display_type(typ: &ModelType, models: &ModelRegistry) -> bool {
+    match typ {
+        ModelType::Primitive(_) | ModelType::Opaque => true,
+        ModelType::Ref(name) => models
+            .get(name)
+            .map(|model| matches!(model.kind, ModelType::Primitive(_) | ModelType::Opaque))
+            .unwrap_or(false),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -553,7 +636,7 @@ mod tests {
         let registry = OperationGenerator::new()
             .collect_operations(&doc, &models)
             .expect("collect");
-        let op = registry.get("post__widgets__id_").expect("operation");
+        let op = registry.get("post_widgets_id").expect("operation");
         assert_eq!(op.method, "post");
         assert_eq!(op.path, "/widgets/{id}");
     }
@@ -600,7 +683,7 @@ mod tests {
         let registry = OperationGenerator::new()
             .collect_operations(&doc, &models)
             .expect("collect");
-        let op = registry.get("get__audit").expect("operation");
+        let op = registry.get("get_audit").expect("operation");
         assert_eq!(op.group, "audit_logs");
     }
 
@@ -659,7 +742,7 @@ mod tests {
         let registry = OperationGenerator::new()
             .collect_operations(&doc, &models)
             .expect("collect");
-        let op = registry.get("get__items__id_").expect("operation");
+        let op = registry.get("get_items_id").expect("operation");
         assert_eq!(op.params.len(), 2);
         let path = op
             .params
@@ -721,7 +804,7 @@ mod tests {
         let registry = OperationGenerator::new()
             .collect_operations(&doc, &models)
             .expect("collect");
-        let op = registry.get("post__widgets").expect("operation");
+        let op = registry.get("post_widgets").expect("operation");
         let body = op.request_body.as_ref().expect("body");
         assert_eq!(body.content_type, "application/json");
         assert_eq!(body.render_type, "i64");
@@ -757,7 +840,7 @@ mod tests {
         let registry = OperationGenerator::new()
             .collect_operations(&doc, &models)
             .expect("collect");
-        let op = registry.get("get__status").expect("operation");
+        let op = registry.get("get_status").expect("operation");
         assert_eq!(op.responses.len(), 1);
         let resp = &op.responses[0];
         assert_eq!(resp.status, Some(StatusCode::Code(200)));
@@ -794,7 +877,7 @@ mod tests {
         let registry = OperationGenerator::new()
             .collect_operations(&doc, &models)
             .expect("collect");
-        let op = registry.get("get__status").expect("operation");
+        let op = registry.get("get_status").expect("operation");
         let response_enum = &op.response_enum;
         assert_eq!(response_enum.name, "GetStatusResponse");
         assert_eq!(response_enum.variants.len(), 1);
@@ -833,7 +916,7 @@ mod tests {
         let registry = OperationGenerator::new()
             .collect_operations(&doc, &models)
             .expect("collect");
-        let op = registry.get("get__widgets").expect("operation");
+        let op = registry.get("get_widgets").expect("operation");
         assert_eq!(op.deps, vec!["Widget"]);
     }
 }
