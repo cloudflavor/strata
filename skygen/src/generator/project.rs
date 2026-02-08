@@ -113,6 +113,9 @@ pub async fn bootstrap_lib(
     base_ctx.insert("config", config);
 
     // Render main project files
+    let mut models_mod_ctx = TeraContext::new();
+    models_mod_ctx.insert("is_models_mod", &true);
+
     let main_plans = [
         RenderPlan {
             template: "templates/cargo.toml.tera",
@@ -132,7 +135,7 @@ pub async fn bootstrap_lib(
         RenderPlan {
             template: "templates/mod.rs.tera",
             out_rel: "src/models/mod.rs".to_string(),
-            extra_ctx: None,
+            extra_ctx: Some(models_mod_ctx),
         },
     ];
 
@@ -158,10 +161,42 @@ pub async fn bootstrap_lib(
     // Generate model files
     let mut models: Vec<RenderPlan> = Vec::new();
     let mut mods: Vec<String> = Vec::new();
-    let type_map = registry.type_map.clone();
+    let mut type_map = registry.type_map.clone();
     let mut alias_models = Vec::new();
 
-    for (name, model) in registry.models.into_iter() {
+    let mut alias_rust_names: Vec<String> = Vec::new();
+    for model in registry.models.values() {
+        if !matches!(
+            model.kind,
+            crate::generator::model::ModelType::Struct(_)
+                | crate::generator::model::ModelType::Composite(_)
+        ) {
+            alias_rust_names.push(model.rust_name.clone());
+        }
+    }
+
+    let alias_module = if !alias_rust_names.is_empty() {
+        let mut candidate = "aliases".to_string();
+        if registry.models.contains_key(&candidate) {
+            candidate = "model_aliases".to_string();
+        }
+        if registry.models.contains_key(&candidate) {
+            candidate = "type_aliases".to_string();
+        }
+        Some(candidate)
+    } else {
+        None
+    };
+
+    if let Some(module_name) = alias_module.as_ref() {
+        for rust_name in &alias_rust_names {
+            type_map.insert(rust_name.clone(), module_name.clone());
+        }
+    }
+
+    for (name, mut model) in registry.models.into_iter() {
+        model.dep_imports =
+            crate::generator::model::group_dep_imports(&model.deps, &type_map);
         match model.kind {
             crate::generator::model::ModelType::Struct(_)
             | crate::generator::model::ModelType::Composite(_) => {
@@ -182,14 +217,7 @@ pub async fn bootstrap_lib(
         }
     }
 
-    if !alias_models.is_empty() {
-        let mut alias_module = "aliases".to_string();
-        if mods.iter().any(|name| name == &alias_module) {
-            alias_module = "model_aliases".to_string();
-        }
-        if mods.iter().any(|name| name == &alias_module) {
-            alias_module = "type_aliases".to_string();
-        }
+    if let (Some(alias_module), true) = (alias_module, !alias_models.is_empty()) {
 
         let mut alias_ctx = TeraContext::new();
         alias_ctx.insert("aliases", &alias_models);
@@ -218,6 +246,7 @@ pub async fn bootstrap_lib(
     // Add module context for models
     let mut mods_ctx = TeraContext::new();
     mods_ctx.insert("modules", &mods);
+    mods_ctx.insert("is_models_mod", &true);
 
     models.push(RenderPlan {
         template: "templates/mod.rs.tera",
