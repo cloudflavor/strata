@@ -25,10 +25,9 @@ pub mod models;
 
 const API_URL: &str = "{{ config.api_url }}";
 
-#[allow(unused_imports)]
 pub mod prelude {
-    pub use crate::apis::*;
-    pub use crate::client::*;
-    pub use crate::errors::*;
-    pub use crate::models::*;
+    pub use crate::apis;
+    pub use crate::client::Client;
+    pub use crate::errors::{ApiError, Error, Result};
+    pub use crate::models;
 }
