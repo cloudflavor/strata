@@ -16,7 +16,7 @@ use anyhow::{anyhow, Result};
 use indexmap::IndexMap;
 use openapiv3::{AnySchema, OpenAPI, ReferenceOr, Schema, SchemaKind, Type};
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// Entrypoint for transforming resolved OpenAPI schemas into model definitions.
 #[derive(Debug, Default)]
@@ -47,7 +47,8 @@ impl ModelGenerator {
             return Ok(registry);
         };
 
-        self.module_name_map = build_component_module_name_map(components.schemas.keys());
+        self.module_name_map =
+            build_component_module_name_map_with_schemas(self, &components.schemas)?;
         registry.name_map = self.module_name_map.clone();
 
         for (name, schema) in components.schemas.iter() {
@@ -58,6 +59,12 @@ impl ModelGenerator {
         self.hoist_inline_models(&mut registry)?;
 
         Ok(registry)
+    }
+
+    /// Finalize a registry after external edits (for example, adding inline models).
+    /// Re-hoists inline shapes and refreshes render types, type maps, and deps.
+    pub fn finalize_registry(&self, registry: &mut ModelRegistry) -> Result<()> {
+        self.hoist_inline_models(registry)
     }
 
     /// Convert one component schema entry into a ModelDef.
@@ -98,10 +105,12 @@ impl ModelGenerator {
                     return Ok(ModelType::Opaque);
                 }
                 let render_variants = variants.iter().map(model_type_to_rust).collect();
+                let render_variant_names = render_composite_variant_names(&variants);
                 Ok(ModelType::Composite(ModelComposite {
                     flavor: CompositeFlavor::OneOf,
                     variants,
                     render_variants,
+                    render_variant_names,
                 }))
             }
             SchemaKind::AnyOf { any_of } => {
@@ -112,10 +121,12 @@ impl ModelGenerator {
                     return Ok(ModelType::Opaque);
                 }
                 let render_variants = variants.iter().map(model_type_to_rust).collect();
+                let render_variant_names = render_composite_variant_names(&variants);
                 Ok(ModelType::Composite(ModelComposite {
                     flavor: CompositeFlavor::AnyOf,
                     variants,
                     render_variants,
+                    render_variant_names,
                 }))
             }
             SchemaKind::AllOf { all_of } => self.all_of_to_struct(all_of, None),
@@ -146,12 +157,19 @@ impl ModelGenerator {
                 .collect();
             let mut name_to_sig = HashMap::new();
             let mut sig_to_name = HashMap::new();
+            let mut name_to_fields: HashMap<String, BTreeSet<String>> = HashMap::new();
+            let mut name_to_typed_fields: HashMap<String, BTreeSet<String>> = HashMap::new();
 
             for (name, model) in registry.models.iter() {
                 if let ModelType::Struct(def) = &model.kind {
                     let sig = struct_signature(def);
                     name_to_sig.insert(name.clone(), sig.clone());
                     sig_to_name.entry(sig).or_insert_with(|| name.clone());
+                    name_to_fields.insert(name.clone(), struct_field_set_from_struct(def));
+                    name_to_typed_fields.insert(name.clone(), struct_typed_field_set(def));
+                } else if let ModelType::Composite(comp) = &model.kind {
+                    name_to_fields.insert(name.clone(), composite_variant_field_set(comp));
+                    name_to_typed_fields.insert(name.clone(), composite_variant_field_set(comp));
                 }
             }
 
@@ -162,6 +180,8 @@ impl ModelGenerator {
                     &mut existing,
                     &mut name_to_sig,
                     &mut sig_to_name,
+                    &mut name_to_fields,
+                    &mut name_to_typed_fields,
                 )? {
                     changed = true;
                 }
@@ -203,6 +223,8 @@ impl ModelGenerator {
         existing: &mut indexmap::IndexSet<String>,
         name_to_sig: &mut HashMap<String, String>,
         sig_to_name: &mut HashMap<String, String>,
+        name_to_fields: &mut HashMap<String, BTreeSet<String>>,
+        name_to_typed_fields: &mut HashMap<String, BTreeSet<String>>,
     ) -> Result<bool> {
         let mut changed = false;
         match &mut model.kind {
@@ -216,6 +238,8 @@ impl ModelGenerator {
                         existing,
                         name_to_sig,
                         sig_to_name,
+                        name_to_fields,
+                        name_to_typed_fields,
                     )?;
                 }
             }
@@ -228,6 +252,8 @@ impl ModelGenerator {
                     existing,
                     name_to_sig,
                     sig_to_name,
+                    name_to_fields,
+                    name_to_typed_fields,
                 )?;
             }
             ModelType::Composite(comp) => {
@@ -240,6 +266,8 @@ impl ModelGenerator {
                         existing,
                         name_to_sig,
                         sig_to_name,
+                        name_to_fields,
+                        name_to_typed_fields,
                     )?;
                 }
             }
@@ -264,6 +292,8 @@ impl ModelGenerator {
         existing: &mut indexmap::IndexSet<String>,
         name_to_sig: &mut HashMap<String, String>,
         sig_to_name: &mut HashMap<String, String>,
+        name_to_fields: &mut HashMap<String, BTreeSet<String>>,
+        name_to_typed_fields: &mut HashMap<String, BTreeSet<String>>,
     ) -> Result<bool> {
         match typ {
             ModelType::Struct(def) => {
@@ -272,13 +302,19 @@ impl ModelGenerator {
                     *typ = ModelType::Ref(existing_name.clone());
                     return Ok(true);
                 }
+                let fields = struct_field_set_from_struct(def);
+                let typed_fields = struct_typed_field_set(def);
                 let name = self.inline_model_name(
                     parent_name,
                     field_name,
                     false,
                     &sig,
+                    Some(&fields),
+                    Some(&typed_fields),
                     existing,
                     name_to_sig,
+                    name_to_fields,
+                    name_to_typed_fields,
                 );
                 let rust_name = sanitize_type_name(&name);
                 let render_type = String::new();
@@ -295,6 +331,8 @@ impl ModelGenerator {
                 additions.push((name.clone(), def));
                 name_to_sig.insert(name.clone(), sig.clone());
                 sig_to_name.insert(sig, name.clone());
+                name_to_fields.insert(name.clone(), fields);
+                name_to_typed_fields.insert(name.clone(), typed_fields);
                 *typ = ModelType::Ref(name);
                 Ok(true)
             }
@@ -305,13 +343,19 @@ impl ModelGenerator {
                         *inner = Box::new(ModelType::Ref(existing_name.clone()));
                         return Ok(true);
                     }
+                    let fields = struct_field_set_from_struct(def);
+                    let typed_fields = struct_typed_field_set(def);
                     let name = self.inline_model_name(
                         parent_name,
                         field_name,
                         true,
                         &sig,
+                        Some(&fields),
+                        Some(&typed_fields),
                         existing,
                         name_to_sig,
+                        name_to_fields,
+                        name_to_typed_fields,
                     );
                     let rust_name = sanitize_type_name(&name);
                     let render_type = String::new();
@@ -328,6 +372,8 @@ impl ModelGenerator {
                     additions.push((name.clone(), def));
                     name_to_sig.insert(name.clone(), sig.clone());
                     sig_to_name.insert(sig, name.clone());
+                    name_to_fields.insert(name.clone(), fields);
+                    name_to_typed_fields.insert(name.clone(), typed_fields);
                     *inner = Box::new(ModelType::Ref(name));
                     Ok(true)
                 }
@@ -339,6 +385,8 @@ impl ModelGenerator {
                     existing,
                     name_to_sig,
                     sig_to_name,
+                    name_to_fields,
+                    name_to_typed_fields,
                 ),
             },
             ModelType::Composite(comp) => {
@@ -351,10 +399,13 @@ impl ModelGenerator {
                         existing,
                         name_to_sig,
                         sig_to_name,
+                        name_to_fields,
+                        name_to_typed_fields,
                     )?;
                 }
                 dedupe_composite_variants(&mut comp.variants);
                 comp.render_variants = comp.variants.iter().map(model_type_to_rust).collect();
+                comp.render_variant_names = render_composite_variant_names(&comp.variants);
 
                 let sig = {
                     let snapshot = ModelType::Composite(comp.clone());
@@ -365,13 +416,18 @@ impl ModelGenerator {
                     return Ok(true);
                 }
 
+                let fields = composite_variant_field_set(comp);
                 let name = self.inline_model_name(
                     parent_name,
                     field_name,
                     false,
                     &sig,
+                    Some(&fields),
+                    Some(&fields),
                     existing,
                     name_to_sig,
+                    name_to_fields,
+                    name_to_typed_fields,
                 );
                 let rust_name = sanitize_type_name(&name);
                 let render_type = String::new();
@@ -386,6 +442,8 @@ impl ModelGenerator {
                 additions.push((name.clone(), def));
                 name_to_sig.insert(name.clone(), sig.clone());
                 sig_to_name.insert(sig, name.clone());
+                name_to_fields.insert(name.clone(), fields);
+                name_to_typed_fields.insert(name.clone(), composite_variant_field_set(comp));
                 *typ = ModelType::Ref(name);
                 Ok(true)
             }
@@ -401,8 +459,12 @@ impl ModelGenerator {
         field_name: Option<&str>,
         array_item: bool,
         signature: &str,
+        fields: Option<&BTreeSet<String>>,
+        typed_fields: Option<&BTreeSet<String>>,
         existing: &mut indexmap::IndexSet<String>,
         name_to_sig: &HashMap<String, String>,
+        name_to_fields: &HashMap<String, BTreeSet<String>>,
+        name_to_typed_fields: &HashMap<String, BTreeSet<String>>,
     ) -> String {
         let mut base = parent_name.to_string();
         if let Some(field) = field_name {
@@ -426,7 +488,95 @@ impl ModelGenerator {
             return base;
         }
 
-        unique_name_with_hash(&base, signature, existing, name_to_sig)
+        if let Some(current_fields) = fields {
+            let existing_fields = name_to_fields
+                .get(&base)
+                .cloned()
+                .unwrap_or_default();
+            let unique_fields: BTreeSet<String> = current_fields
+                .difference(&existing_fields)
+                .cloned()
+                .collect();
+            if !unique_fields.is_empty() {
+                for suffix in candidate_suffixes(&unique_fields) {
+                    let candidate = format!("{base}_{suffix}");
+                    if let Some(existing_sig) = name_to_sig.get(&candidate) {
+                        if existing_sig == signature {
+                            return candidate;
+                        }
+                    }
+                    if !existing.contains(&candidate) {
+                        existing.insert(candidate.clone());
+                        return candidate;
+                    }
+                }
+            }
+
+            let missing_fields: BTreeSet<String> = existing_fields
+                .difference(current_fields)
+                .cloned()
+                .collect();
+            if !missing_fields.is_empty() {
+                for suffix in candidate_suffixes(&missing_fields) {
+                    let candidate = format!("{base}_no_{suffix}");
+                    if let Some(existing_sig) = name_to_sig.get(&candidate) {
+                        if existing_sig == signature {
+                            return candidate;
+                        }
+                    }
+                    if !existing.contains(&candidate) {
+                        existing.insert(candidate.clone());
+                        return candidate;
+                    }
+                }
+            }
+
+            if let Some(current_typed) = typed_fields {
+                let existing_typed = name_to_typed_fields
+                    .get(&base)
+                    .cloned()
+                    .unwrap_or_default();
+                let unique_typed: BTreeSet<String> = current_typed
+                    .difference(&existing_typed)
+                    .cloned()
+                    .collect();
+                if !unique_typed.is_empty() {
+                    for suffix in candidate_suffixes(&unique_typed) {
+                        let candidate = format!("{base}_{suffix}");
+                        if let Some(existing_sig) = name_to_sig.get(&candidate) {
+                            if existing_sig == signature {
+                                return candidate;
+                            }
+                        }
+                        if !existing.contains(&candidate) {
+                            existing.insert(candidate.clone());
+                            return candidate;
+                        }
+                    }
+                }
+            }
+
+            tracing::debug!(
+                base = %base,
+                current_sig = %signature,
+                existing_sig = %name_to_sig
+                    .get(&base)
+                    .map(|s| s.as_str())
+                    .unwrap_or_default(),
+                "inline model name collision has no unique fields"
+            );
+            panic!(
+                "inline model name collision for '{base}': no unique fields to disambiguate; rename schema"
+            );
+        }
+        tracing::debug!(
+            base = %base,
+            current_sig = %signature,
+            "inline model name collision has no field context"
+        );
+        panic!(
+            "inline model name collision for '{base}': no field context to disambiguate; rename schema"
+        );
     }
 
     /// Recompute render_type for each model and its fields.
@@ -451,6 +601,7 @@ impl ModelGenerator {
                 ModelType::Composite(comp) => {
                     dedupe_composite_variants(&mut comp.variants);
                     comp.render_variants = render_composite_variants(&comp.variants, &boxed_types);
+                    comp.render_variant_names = render_composite_variant_names(&comp.variants);
                 }
                 _ => {}
             }
@@ -551,10 +702,12 @@ impl ModelGenerator {
                 return Ok(ModelType::Opaque);
             }
             let render_variants = variants.iter().map(model_type_to_rust).collect();
+            let render_variant_names = render_composite_variant_names(&variants);
             return Ok(ModelType::Composite(ModelComposite {
                 flavor: CompositeFlavor::OneOf,
                 variants,
                 render_variants,
+                render_variant_names,
             }));
         }
 
@@ -566,10 +719,12 @@ impl ModelGenerator {
                 return Ok(ModelType::Opaque);
             }
             let render_variants = variants.iter().map(model_type_to_rust).collect();
+            let render_variant_names = render_composite_variant_names(&variants);
             return Ok(ModelType::Composite(ModelComposite {
                 flavor: CompositeFlavor::AnyOf,
                 variants,
                 render_variants,
+                render_variant_names,
             }));
         }
 
@@ -774,7 +929,7 @@ pub enum ModelType {
 }
 
 /// The supported primitive scalar types.
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 pub enum PrimitiveType {
     /// String-like data.
     String,
@@ -821,6 +976,8 @@ pub struct ModelComposite {
     pub variants: Vec<ModelType>,
     /// The rendered Rust type for each variant.
     pub render_variants: Vec<String>,
+    /// The rendered Rust enum variant name for each composite variant.
+    pub render_variant_names: Vec<String>,
 }
 
 /// The type of composite schema.
@@ -934,7 +1091,7 @@ fn struct_signature(def: &ModelStruct) -> String {
 
 /// Produce a stable signature string for any ModelType.
 /// Used to dedupe and hoist inline/composite types.
-fn type_signature(typ: &ModelType) -> String {
+pub(crate) fn type_signature(typ: &ModelType) -> String {
     match typ {
         ModelType::Primitive(PrimitiveType::String) => "prim:string".into(),
         ModelType::Primitive(PrimitiveType::Number) => "prim:number".into(),
@@ -977,6 +1134,71 @@ fn render_composite_variants(
         .collect()
 }
 
+fn render_composite_variant_names(variants: &[ModelType]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::with_capacity(variants.len());
+    let field_sets: Vec<Option<BTreeSet<String>>> = variants
+        .iter()
+        .map(variant_field_set_for_name)
+        .collect();
+
+    for (idx, variant) in variants.iter().enumerate() {
+        let mut candidates = Vec::new();
+        if let Some(fields) = field_sets.get(idx).and_then(|set| set.clone()) {
+            let mut others_union: BTreeSet<String> = BTreeSet::new();
+            for (j, other) in field_sets.iter().enumerate() {
+                if j == idx {
+                    continue;
+                }
+                if let Some(set) = other {
+                    for item in set {
+                        others_union.insert(item.clone());
+                    }
+                }
+            }
+            let unique_fields: BTreeSet<String> =
+                fields.difference(&others_union).cloned().collect();
+            if !unique_fields.is_empty() {
+                for suffix in variant_suffix_candidates(&unique_fields) {
+                    candidates.push(format!("inline_{suffix}"));
+                }
+            }
+        }
+        candidates.extend(composite_variant_name_candidates(variant));
+
+        let mut deduped = Vec::new();
+        let mut seen_local = HashSet::new();
+        for candidate in candidates.into_iter() {
+            if seen_local.insert(candidate.clone()) {
+                deduped.push(candidate);
+            }
+        }
+        let candidates = deduped;
+
+        let mut chosen: Option<String> = None;
+        for candidate in candidates.iter().cloned() {
+            if candidate.is_empty() {
+                continue;
+            }
+            let rust_name = sanitize_type_name(&candidate);
+            if seen.insert(rust_name.clone()) {
+                chosen = Some(rust_name);
+                break;
+            }
+        }
+        let Some(chosen) = chosen else {
+            tracing::debug!(
+                variant_sig = %type_signature(variant),
+                candidates = ?candidates,
+                "composite variant name collision"
+            );
+            panic!("composite variant name collision");
+        };
+        out.push(chosen);
+    }
+    out
+}
+
 /// Render a single composite variant to a Rust type string.
 /// Boxes refs that point at struct/composite models.
 fn render_composite_variant(variant: &ModelType, boxed_types: &HashSet<String>) -> String {
@@ -995,6 +1217,160 @@ fn render_composite_variant(variant: &ModelType, boxed_types: &HashSet<String>) 
     }
 }
 
+fn composite_variant_name(variant: &ModelType) -> String {
+    composite_variant_name_candidates(variant)
+        .into_iter()
+        .next()
+        .unwrap_or_default()
+}
+
+fn composite_variant_name_candidates(variant: &ModelType) -> Vec<String> {
+    match variant {
+        ModelType::Ref(name) => vec![sanitize_type_name(name)],
+        ModelType::Array(inner) => {
+            let mut out = Vec::new();
+            for candidate in composite_variant_name_candidates(inner) {
+                if candidate.is_empty() {
+                    continue;
+                }
+                out.push(format!("List{candidate}"));
+            }
+            if out.is_empty() {
+                out.push("List".to_string());
+            }
+            out
+        }
+        ModelType::Primitive(PrimitiveType::String) => vec!["String".to_string()],
+        ModelType::Primitive(PrimitiveType::Number) => vec!["Number".to_string()],
+        ModelType::Primitive(PrimitiveType::Integer) => vec!["Integer".to_string()],
+        ModelType::Primitive(PrimitiveType::Boolean) => vec!["Boolean".to_string()],
+        ModelType::Struct(def) => inline_struct_variant_candidates(def),
+        ModelType::Composite(comp) => inline_composite_variant_candidates(comp),
+        ModelType::Opaque => vec!["Value".to_string()],
+    }
+}
+
+fn variant_field_set_for_name(variant: &ModelType) -> Option<BTreeSet<String>> {
+    match variant {
+        ModelType::Struct(def) => Some(struct_field_set_from_struct(def)),
+        ModelType::Composite(comp) => Some(composite_variant_field_set(comp)),
+        _ => None,
+    }
+}
+
+fn variant_suffix_candidates(fields: &BTreeSet<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut full: Vec<String> = fields.iter().cloned().collect();
+    full.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
+    out.extend(full.into_iter());
+
+    let mut tokens: BTreeSet<String> = BTreeSet::new();
+    for field in fields {
+        for token in field.split('_') {
+            if token.len() >= 3 {
+                tokens.insert(token.to_string());
+            }
+        }
+    }
+    let mut tokens: Vec<String> = tokens.into_iter().collect();
+    tokens.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
+    out.extend(tokens);
+    out
+}
+
+fn inline_struct_variant_candidates(def: &ModelStruct) -> Vec<String> {
+    let fields = struct_field_set_from_struct(def);
+    let mut candidates = Vec::new();
+    for suffix in variant_suffix_candidates(&fields) {
+        candidates.push(format!("inline_{suffix}"));
+    }
+
+    let mut typed_tokens: BTreeSet<String> = BTreeSet::new();
+    for field in &def.fields {
+        let name = sanitize_module_name(&field.name);
+        if name.is_empty() {
+            continue;
+        }
+        let typ = type_token_for_variant(&field.typ);
+        if typ.is_empty() {
+            continue;
+        }
+        typed_tokens.insert(format!("{name}_{typ}"));
+    }
+    let mut typed_vec: Vec<String> = typed_tokens.into_iter().collect();
+    typed_vec.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
+    for suffix in typed_vec {
+        candidates.push(format!("inline_{suffix}"));
+    }
+
+    let mut combined_parts: Vec<String> = Vec::new();
+    for field in &def.fields {
+        let name = sanitize_module_name(&field.name);
+        if !name.is_empty() {
+            combined_parts.push(name);
+        }
+        let typ = type_token_for_variant(&field.typ);
+        if !typ.is_empty() {
+            combined_parts.push(typ);
+        }
+    }
+    if !combined_parts.is_empty() {
+        candidates.push(format!("inline_{}", combined_parts.join("_")));
+    }
+
+    if candidates.is_empty() {
+        candidates.push("Inline".to_string());
+    }
+    candidates
+}
+
+fn inline_composite_variant_candidates(comp: &ModelComposite) -> Vec<String> {
+    let fields = composite_variant_field_set(comp);
+    let mut candidates = Vec::new();
+    for suffix in variant_suffix_candidates(&fields) {
+        candidates.push(format!("inline_{suffix}"));
+    }
+    if candidates.is_empty() {
+        candidates.push("Inline".to_string());
+    }
+    candidates
+}
+
+fn type_token_for_variant(typ: &ModelType) -> String {
+    match typ {
+        ModelType::Primitive(PrimitiveType::String) => "string".to_string(),
+        ModelType::Primitive(PrimitiveType::Number) => "number".to_string(),
+        ModelType::Primitive(PrimitiveType::Integer) => "integer".to_string(),
+        ModelType::Primitive(PrimitiveType::Boolean) => "boolean".to_string(),
+        ModelType::Ref(name) => sanitize_module_name(name),
+        ModelType::Array(inner) => {
+            let inner = type_token_for_variant(inner);
+            if inner.is_empty() {
+                "list".to_string()
+            } else {
+                format!("list_{inner}")
+            }
+        }
+        ModelType::Struct(def) => {
+            let fields = struct_field_set_from_struct(def);
+            let suffix = candidate_suffixes(&fields)
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| "struct".to_string());
+            format!("struct_{suffix}")
+        }
+        ModelType::Composite(comp) => {
+            let fields = composite_variant_field_set(comp);
+            let suffix = candidate_suffixes(&fields)
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| "composite".to_string());
+            format!("composite_{suffix}")
+        }
+        ModelType::Opaque => "value".to_string(),
+    }
+}
+
 /// Return the OpenAPI flavor name for a composite.
 /// Used in signatures and debug output.
 fn composite_flavor_name(flavor: CompositeFlavor) -> &'static str {
@@ -1007,74 +1383,156 @@ fn composite_flavor_name(flavor: CompositeFlavor) -> &'static str {
 
 /// Build a unique module-name map for all schema keys.
 /// Disambiguates collisions from sanitization.
-fn build_component_module_name_map<'a>(
-    names: impl Iterator<Item = &'a String> + Clone,
-) -> HashMap<String, String> {
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    for name in names.clone() {
+fn build_component_module_name_map_with_schemas(
+    generator: &mut ModelGenerator,
+    schemas: &IndexMap<String, ReferenceOr<Schema>>,
+) -> Result<HashMap<String, String>> {
+    let mut temp_map: HashMap<String, String> = HashMap::new();
+    for name in schemas.keys() {
+        temp_map.insert(name.clone(), sanitize_module_name(name));
+    }
+    generator.module_name_map = temp_map;
+
+    let mut groups: IndexMap<String, Vec<(&String, &ReferenceOr<Schema>)>> = IndexMap::new();
+    for (name, schema) in schemas.iter() {
         let base = sanitize_module_name(name);
-        *counts.entry(base).or_insert(0) += 1;
+        groups.entry(base).or_default().push((name, schema));
     }
 
     let mut used: HashSet<String> = HashSet::new();
     let mut map: HashMap<String, String> = HashMap::new();
 
-    for name in names {
-        let base = sanitize_module_name(name);
-        let resolved = if counts.get(&base).copied().unwrap_or(0) == 1 {
-            base
-        } else {
-            sanitize_module_name_disambiguated(name)
-        };
-        let resolved = ensure_unique_name(resolved, &mut used, name);
-        map.insert(name.clone(), resolved);
+    for (base, items) in groups {
+        let mut sig_groups: IndexMap<String, SigGroup> = IndexMap::new();
+
+        for (name, schema) in items {
+            let typ = generator.schema_ref_to_type(schema).map_err(|e| {
+                anyhow!(
+                    "failed to resolve schema for name collision check: {name}: {e}"
+                )
+            })?;
+            let sig = type_signature(&typ);
+            let fields = struct_field_set(&typ);
+            let entry = sig_groups.entry(sig.clone()).or_insert_with(|| SigGroup {
+                sig,
+                names: Vec::new(),
+                fields,
+            });
+            entry.names.push(name.clone());
+        }
+
+        if sig_groups.len() == 1 {
+            if used.contains(&base) {
+                return Err(anyhow!(
+                    "schema name collision after sanitization: base '{base}' already used"
+                ));
+            }
+            used.insert(base.clone());
+            let only = sig_groups.values().next().expect("group");
+            for name in &only.names {
+                map.insert(name.clone(), base.clone());
+            }
+            continue;
+        }
+
+        let mut union_fields: BTreeSet<String> = BTreeSet::new();
+        for group in sig_groups.values() {
+            let Some(fields) = &group.fields else {
+                return Err(anyhow!(
+                    "schema name collision after sanitization: base '{base}' includes non-struct schema(s); rename schemas to disambiguate"
+                ));
+            };
+            union_fields.extend(fields.iter().cloned());
+        }
+
+        let mut assigned: HashSet<String> = HashSet::new();
+        for group in sig_groups.values() {
+            let fields = group.fields.as_ref().expect("fields");
+            let mut other_fields = union_fields.clone();
+            for field in fields {
+                other_fields.remove(field);
+            }
+            let unique_fields: BTreeSet<String> =
+                fields.difference(&other_fields).cloned().collect();
+            if unique_fields.is_empty() {
+                let first = group.names.first().map(|s| s.as_str()).unwrap_or("unknown");
+                let first_ref = format!(
+                    "#/components/schemas/{}",
+                    json_pointer_escape(first)
+                );
+                tracing::debug!(
+                    base = %base,
+                    name = %first,
+                    sig = %group.sig,
+                    ref_ptr = %first_ref,
+                    "schema name collision after sanitization has no unique fields"
+                );
+                return Err(anyhow!(
+                    "schema name collision after sanitization: base '{base}' has no unique fields to derive a name; rename schemas to disambiguate"
+                ));
+            }
+
+            let candidates = candidate_suffixes(&unique_fields);
+            let mut chosen: Option<String> = None;
+            for suffix in candidates {
+                let candidate = format!("{base}_{suffix}");
+                if used.contains(&candidate) || assigned.contains(&candidate) {
+                    continue;
+                }
+                chosen = Some(candidate);
+                break;
+            }
+
+            let Some(chosen) = chosen else {
+                return Err(anyhow!(
+                    "schema name collision after sanitization: base '{base}' could not derive a unique suffix; rename schemas to disambiguate"
+                ));
+            };
+
+            for name in &group.names {
+                map.insert(name.clone(), chosen.clone());
+            }
+            assigned.insert(chosen.clone());
+            used.insert(chosen);
+        }
     }
 
-    map
+    Ok(map)
 }
 
 /// Ensure a module name is unique in the used set.
 /// Adds a stable suffix when collisions occur.
+#[allow(dead_code)]
 fn ensure_unique_name(name: String, used: &mut HashSet<String>, seed: &str) -> String {
     if !used.contains(&name) {
         used.insert(name.clone());
         return name;
     }
 
-    let mut attempt = 0usize;
+    let _ = seed;
+    let mut idx = 2usize;
     loop {
-        let salt = if attempt == 0 {
-            seed.to_string()
-        } else {
-            format!("{seed}:{attempt}")
-        };
-        let suffix = alpha_hash(&salt);
-        let candidate = format!("{name}_{suffix}");
+        let candidate = format!("{name}_{idx}");
         if !used.contains(&candidate) {
             used.insert(candidate.clone());
             return candidate;
         }
-        attempt += 1;
+        idx += 1;
     }
 }
 
 /// Generate a deterministic unique name from a signature.
 /// Keeps existing matches stable across runs.
+#[allow(dead_code)]
 fn unique_name_with_hash(
     base: &str,
     signature: &str,
     existing: &mut indexmap::IndexSet<String>,
     name_to_sig: &HashMap<String, String>,
 ) -> String {
-    let mut attempt = 0usize;
+    let mut idx = 2usize;
     loop {
-        let salt = if attempt == 0 {
-            signature.to_string()
-        } else {
-            format!("{signature}:{attempt}")
-        };
-        let suffix = alpha_hash(&salt);
-        let candidate = format!("{base}_{suffix}");
+        let candidate = format!("{base}_{idx}");
         if let Some(existing_sig) = name_to_sig.get(&candidate) {
             if existing_sig == signature {
                 return candidate;
@@ -1084,23 +1542,88 @@ fn unique_name_with_hash(
             existing.insert(candidate.clone());
             return candidate;
         }
-        attempt += 1;
+        idx += 1;
     }
 }
 
-/// Hash helper that yields a short alphabetic suffix.
-/// Used for stable name disambiguation.
-fn alpha_hash(input: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    input.hash(&mut hasher);
-    let mut value = hasher.finish();
-    let mut out = String::new();
-    for _ in 0..6 {
-        let idx = (value % 26) as u8;
-        out.push((b'a' + idx) as char);
-        value /= 26;
+fn json_pointer_escape(input: &str) -> String {
+    input.replace('~', "~0").replace('/', "~1")
+}
+
+#[derive(Debug, Clone)]
+struct SigGroup {
+    sig: String,
+    names: Vec<String>,
+    fields: Option<BTreeSet<String>>,
+}
+
+fn struct_field_set_from_struct(def: &ModelStruct) -> BTreeSet<String> {
+    let mut fields = BTreeSet::new();
+    for field in &def.fields {
+        let name = sanitize_module_name(&field.name);
+        if !name.is_empty() {
+            fields.insert(name);
+        }
     }
+    fields
+}
+
+fn struct_typed_field_set(def: &ModelStruct) -> BTreeSet<String> {
+    let mut fields = BTreeSet::new();
+    for field in &def.fields {
+        let name = sanitize_module_name(&field.name);
+        if name.is_empty() {
+            continue;
+        }
+        let typ = type_token_for_variant(&field.typ);
+        if typ.is_empty() {
+            continue;
+        }
+        fields.insert(format!("{name}_{typ}"));
+    }
+    fields
+}
+
+fn composite_variant_field_set(comp: &ModelComposite) -> BTreeSet<String> {
+    let mut fields = BTreeSet::new();
+    for variant in &comp.variants {
+        let name = composite_variant_name(variant);
+        let sanitized = sanitize_module_name(&name);
+        if !sanitized.is_empty() {
+            fields.insert(sanitized.clone());
+            for token in sanitized.split('_') {
+                if !token.is_empty() {
+                    fields.insert(token.to_string());
+                }
+            }
+        }
+    }
+    fields
+}
+
+fn struct_field_set(typ: &ModelType) -> Option<BTreeSet<String>> {
+    match typ {
+        ModelType::Struct(def) => Some(struct_field_set_from_struct(def)),
+        _ => None,
+    }
+}
+
+fn candidate_suffixes(unique_fields: &BTreeSet<String>) -> Vec<String> {
+    let mut candidates: BTreeSet<String> = BTreeSet::new();
+    for field in unique_fields {
+        let sanitized = sanitize_module_name(field);
+        if sanitized.is_empty() {
+            continue;
+        }
+        for token in sanitized.split('_') {
+            if !token.is_empty() {
+                candidates.insert(token.to_string());
+            }
+        }
+        candidates.insert(sanitized);
+    }
+    let mut out: Vec<String> = candidates.into_iter().collect();
+    out.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
     out
 }
 
@@ -1222,6 +1745,7 @@ pub fn sanitize_module_name(name: &str) -> String {
 
 /// Sanitize a schema name while encoding separator types.
 /// Used when raw sanitization would collide.
+#[allow(dead_code)]
 fn sanitize_module_name_disambiguated(name: &str) -> String {
     let mut out = String::new();
     for ch in name.chars() {
@@ -2065,13 +2589,18 @@ mod tests {
         existing.insert("container_inner".into());
         let mut name_to_sig = HashMap::new();
         name_to_sig.insert("container_inner".into(), "sig".into());
+        let name_to_fields: HashMap<String, BTreeSet<String>> = HashMap::new();
+        let name_to_typed_fields: HashMap<String, BTreeSet<String>> = HashMap::new();
         let name = generator.inline_model_name(
             "Container",
             Some("inner"),
             false,
             "sig",
+            None,
             &mut existing,
             &name_to_sig,
+            &name_to_fields,
+            &name_to_typed_fields,
         );
         assert_eq!(name, "container_inner");
     }
@@ -2103,6 +2632,7 @@ mod tests {
                     flavor: CompositeFlavor::OneOf,
                     variants: vec![ModelType::Ref("Node".into())],
                     render_variants: Vec::new(),
+                    render_variant_names: Vec::new(),
                 }),
             },
         );
@@ -2114,6 +2644,7 @@ mod tests {
             panic!("expected composite");
         };
         assert_eq!(comp.render_variants, vec!["Box<Node>"]);
+        assert_eq!(comp.render_variant_names, vec!["Node"]);
     }
 
     /// Ensure refresh_type_map builds the Rust type map.
@@ -2452,6 +2983,7 @@ mod tests {
                 ModelType::Primitive(PrimitiveType::Integer),
             ],
             render_variants: Vec::new(),
+            render_variant_names: Vec::new(),
         };
         let sig = type_signature(&ModelType::Composite(comp));
         assert!(sig.contains("oneOf"));
@@ -2512,11 +3044,24 @@ mod tests {
     /// Ensure build_component_module_name_map avoids name collisions.
     #[test]
     fn build_component_module_name_map_disambiguates() {
-        let names = vec!["foo-bar".to_string(), "foo_bar".to_string()];
-        let map = build_component_module_name_map(names.iter());
-        let first = map.get("foo-bar").unwrap();
-        let second = map.get("foo_bar").unwrap();
-        assert_ne!(first, second);
+        let mut generator = ModelGenerator::new();
+        let mut schemas = IndexMap::new();
+        schemas.insert(
+            "foo-bar".to_string(),
+            ReferenceOr::Item(Schema {
+                schema_data: Default::default(),
+                schema_kind: SchemaKind::Type(Type::String(Default::default())),
+            }),
+        );
+        schemas.insert(
+            "foo_bar".to_string(),
+            ReferenceOr::Item(Schema {
+                schema_data: Default::default(),
+                schema_kind: SchemaKind::Type(Type::Integer(Default::default())),
+            }),
+        );
+        let result = build_component_module_name_map_with_schemas(&mut generator, &schemas);
+        assert!(result.is_err());
     }
 
     /// Ensure ensure_unique_name appends a suffix on collision.
@@ -2535,19 +3080,11 @@ mod tests {
         let mut used = IndexSet::new();
         let mut name_to_sig = HashMap::new();
         let signature = "sig";
-        let candidate = format!("base_{}", alpha_hash(signature));
+        let candidate = "base_2".to_string();
         used.insert(candidate.clone());
         name_to_sig.insert(candidate.clone(), signature.to_string());
         let result = unique_name_with_hash("base", signature, &mut used, &name_to_sig);
         assert_eq!(result, candidate);
-    }
-
-    /// Ensure alpha_hash returns six lowercase letters.
-    #[test]
-    fn alpha_hash_is_six_lowercase_letters() {
-        let hash = alpha_hash("seed");
-        assert_eq!(hash.len(), 6);
-        assert!(hash.chars().all(|c| c.is_ascii_lowercase()));
     }
 
     /// Ensure collect_model_deps extracts referenced model names.
