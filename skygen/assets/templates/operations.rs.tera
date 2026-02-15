@@ -20,27 +20,60 @@ use crate::client::Client;
 use crate::errors::{ApiError, Error, Result};
 {%- else -%}
 use crate::errors::Result;
-{%- endif %}
+{%- endif -%}
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 {% if uses_header_value -%}
 use reqwest::header::HeaderValue;
-{%- endif %}
+{%- endif -%}
 {% if uses_content_type -%}
 use reqwest::header::CONTENT_TYPE;
-{%- endif %}
+{%- endif -%}
 {% if uses_cookie_header -%}
 use reqwest::header::COOKIE;
-{%- endif %}
+{%- endif -%}
 {% if dep_imports is defined and dep_imports | length > 0 -%}
 {% for imp in dep_imports -%}
 {% if imp.types | length > 1 -%}
-use crate::models::{{ imp.module }}::{% for dep in imp.types %}{{ dep }}{% if not loop.last %}, {% endif %}{% endfor %};
+use crate::models::{{ imp.module }}::{{ "{" }}{% for dep in imp.types %}{{ dep }}{% if not loop.last %}, {% endif %}{% endfor %}{{ "}" }};
 {%- else -%}
 use crate::models::{{ imp.module }}::{{ imp.types | first }};
 {%- endif -%}
 {%- endfor -%}
 {%- endif %}
+
+pub struct {{ service_name }}<'a> {
+    client: &'a Client,
+}
+
+impl Client {
+    pub fn {{ service_method }}(&self) -> {{ service_name }}<'_> {
+        {{ service_name }} { client: self }
+    }
+}
+
+impl<'a> {{ service_name }}<'a> {
+{%- for operation in operations %}
+    pub fn {{ operation.short_name }}(&'a self
+{%- for param in operation.required_params %}
+        , {{ param.rust_name }}: {{ param.render_type }}
+{%- endfor %}
+{%- if operation.request_body and operation.request_body.required %}
+        , body: {{ operation.request_body.render_type }}
+{%- endif %}
+    ) -> {{ operation.builder_name }}<'a> {
+        {{ operation.builder_name }}::new(self.client
+{%- for param in operation.required_params %}
+            , {{ param.rust_name }}
+{%- endfor %}
+{%- if operation.request_body and operation.request_body.required %}
+            , body
+{%- endif %}
+        )
+    }
+
+{%- endfor %}
+}
 
 {% for operation in operations -%}
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,47 +83,92 @@ pub enum {{ operation.response_enum.name }} {
 {%- endfor %}
 }
 
-pub async fn {{ operation.id }}(
-    client: &Client,
-{%- for param in operation.params %}
-    {{ param.rust_name }}: {% if not param.required %}Option<{{ param.render_type }}>{% else %}{{ param.render_type }}{% endif %},
+pub struct {{ operation.builder_name }}<'a> {
+    client: &'a Client,
+{%- for param in operation.required_params %}
+    {{ param.rust_name }}: {{ param.render_type }},
+{%- endfor %}
+{%- for param in operation.optional_params %}
+    {{ param.rust_name }}: Option<{{ param.render_type }}>,
 {%- endfor %}
 {%- if operation.request_body %}
-    body: {% if not operation.request_body.required %}Option<{{ operation.request_body.render_type }}>{% else %}{{ operation.request_body.render_type }}{% endif %},
-{%- endif %}
-) -> Result<{{ operation.response_enum.name }}> {
-{%- if operation.has_path_params %}
-    let mut endpoint_path = "{{ operation.path }}".to_string();
+{%- if operation.request_body.required %}
+    body: {{ operation.request_body.render_type }},
 {%- else %}
-    let endpoint_path = "{{ operation.path }}".to_string();
+    body: Option<{{ operation.request_body.render_type }}>,
+{%- endif %}
+{%- endif %}
+}
+
+impl<'a> {{ operation.builder_name }}<'a> {
+    fn new(client: &'a Client
+{%- for param in operation.required_params %}
+        , {{ param.rust_name }}: {{ param.render_type }}
+{%- endfor %}
+{%- if operation.request_body and operation.request_body.required %}
+        , body: {{ operation.request_body.render_type }}
+{%- endif %}
+    ) -> Self {
+        Self {
+            client,
+{%- for param in operation.required_params %}
+            {{ param.rust_name }},
+{%- endfor %}
+{%- for param in operation.optional_params %}
+            {{ param.rust_name }}: None,
+{%- endfor %}
+{%- if operation.request_body %}
+{%- if operation.request_body.required %}
+            body,
+{%- else %}
+            body: None,
+{%- endif %}
+{%- endif %}
+        }
+    }
+
+{%- for param in operation.optional_params %}
+    pub fn {{ param.rust_name }}(mut self, {{ param.rust_name }}: {{ param.render_type }}) -> Self {
+        self.{{ param.rust_name }} = Some({{ param.rust_name }});
+        self
+    }
+
+{%- endfor %}
+{%- if operation.request_body and not operation.request_body.required %}
+    pub fn body(mut self, body: {{ operation.request_body.render_type }}) -> Self {
+        self.body = Some(body);
+        self
+    }
+
+{%- endif %}
+    pub async fn send(self) -> Result<{{ operation.response_enum.name }}> {
+{%- if operation.has_path_params %}
+        let mut endpoint_path = "{{ operation.path }}".to_string();
+{%- else %}
+        let endpoint_path = "{{ operation.path }}".to_string();
 {%- endif %}
 {%- if operation.has_path_params %}
 {%- for param in operation.params %}
 {%- if param.location == "Path" %}
-    {% set placeholder = "{" ~ param.name ~ "}" %}
-    endpoint_path = endpoint_path.replace("{{ placeholder }}", &{{ param.rust_name }}.to_string());
+        {% set placeholder = "{" ~ param.name ~ "}" %}
+{%- if param.is_display %}
+        endpoint_path = endpoint_path.replace("{{ placeholder }}", &self.{{ param.rust_name }}.to_string());
+{%- else %}
+        let encoded = serde_json::to_string(&self.{{ param.rust_name }})?;
+        endpoint_path = endpoint_path.replace("{{ placeholder }}", &encoded);
+{%- endif %}
 {%- endif %}
 {%- endfor %}
 {%- endif %}
 {%- if operation.has_query_params %}
-    let mut request_url = client.join_url(&endpoint_path)?;
-    {
-        let mut pairs = request_url.query_pairs_mut();
+        let mut request_url = self.client.join_url(&endpoint_path)?;
+        {
+            let mut pairs = request_url.query_pairs_mut();
 {%- for param in operation.params %}
 {%- if param.location == "Query" %}
 {%- if param.is_array %}
 {%- if param.required %}
-        for value in {{ param.rust_name }} {
-{%- if param.array_item_is_primitive %}
-            pairs.append_pair("{{ param.name }}", &value.to_string());
-{%- else %}
-            let encoded = serde_json::to_string(&value)?;
-            pairs.append_pair("{{ param.name }}", &encoded);
-{%- endif %}
-        }
-{%- else %}
-        if let Some(values) = {{ param.rust_name }} {
-            for value in values {
+            for value in self.{{ param.rust_name }} {
 {%- if param.array_item_is_primitive %}
                 pairs.append_pair("{{ param.name }}", &value.to_string());
 {%- else %}
@@ -98,88 +176,137 @@ pub async fn {{ operation.id }}(
                 pairs.append_pair("{{ param.name }}", &encoded);
 {%- endif %}
             }
-        }
+{%- else %}
+            if let Some(values) = self.{{ param.rust_name }} {
+                for value in values {
+{%- if param.array_item_is_primitive %}
+                    pairs.append_pair("{{ param.name }}", &value.to_string());
+{%- else %}
+                    let encoded = serde_json::to_string(&value)?;
+                    pairs.append_pair("{{ param.name }}", &encoded);
+{%- endif %}
+                }
+            }
 {%- endif %}
 {%- else %}
 {%- if param.required %}
-        pairs.append_pair("{{ param.name }}", &{{ param.rust_name }}.to_string());
+{%- if param.is_display %}
+            pairs.append_pair("{{ param.name }}", &self.{{ param.rust_name }}.to_string());
 {%- else %}
-        if let Some(value) = {{ param.rust_name }} {
-            pairs.append_pair("{{ param.name }}", &value.to_string());
-        }
+            let encoded = serde_json::to_string(&self.{{ param.rust_name }})?;
+            pairs.append_pair("{{ param.name }}", &encoded);
+{%- endif %}
+{%- else %}
+            if let Some(value) = self.{{ param.rust_name }} {
+{%- if param.is_display %}
+                pairs.append_pair("{{ param.name }}", &value.to_string());
+{%- else %}
+                let encoded = serde_json::to_string(&value)?;
+                pairs.append_pair("{{ param.name }}", &encoded);
+{%- endif %}
+            }
 {%- endif %}
 {%- endif %}
 {%- endif %}
 {%- endfor %}
-        drop(pairs);
-    }
+            drop(pairs);
+        }
 {%- else %}
-    let request_url = client.join_url(&endpoint_path)?;
+        let request_url = self.client.join_url(&endpoint_path)?;
 {%- endif %}
 
 {%- if operation.has_header_params or operation.has_cookie_params or operation.request_body %}
-    let mut req = reqwest::Request::new(Method::{{ operation.method | upper }}, request_url);
+        let mut req = reqwest::Request::new(Method::{{ operation.method | upper }}, request_url);
 {%- else %}
-    let req = reqwest::Request::new(Method::{{ operation.method | upper }}, request_url);
+        let req = reqwest::Request::new(Method::{{ operation.method | upper }}, request_url);
 {%- endif %}
 {%- if operation.has_header_params %}
 {%- for param in operation.params %}
 {%- if param.location == "Header" %}
 {%- if param.required %}
-    if let Ok(value) = HeaderValue::from_str(&{{ param.rust_name }}.to_string()) {
-        req.headers_mut().insert("{{ param.name }}", value);
-    }
-{%- else %}
-    if let Some(value) = {{ param.rust_name }} {
-        if let Ok(value) = HeaderValue::from_str(&value.to_string()) {
+{%- if param.is_display %}
+        if let Ok(value) = HeaderValue::from_str(&self.{{ param.rust_name }}.to_string()) {
             req.headers_mut().insert("{{ param.name }}", value);
         }
-    }
+{%- else %}
+        let encoded = serde_json::to_string(&self.{{ param.rust_name }})?;
+        if let Ok(value) = HeaderValue::from_str(&encoded) {
+            req.headers_mut().insert("{{ param.name }}", value);
+        }
+{%- endif %}
+{%- else %}
+        if let Some(value) = self.{{ param.rust_name }} {
+{%- if param.is_display %}
+            if let Ok(value) = HeaderValue::from_str(&value.to_string()) {
+                req.headers_mut().insert("{{ param.name }}", value);
+            }
+{%- else %}
+            let encoded = serde_json::to_string(&value)?;
+            if let Ok(value) = HeaderValue::from_str(&encoded) {
+                req.headers_mut().insert("{{ param.name }}", value);
+            }
+{%- endif %}
+        }
 {%- endif %}
 {%- endif %}
 {%- endfor %}
 {%- endif %}
 
 {%- if operation.has_cookie_params %}
-    let mut cookie_parts: Vec<String> = Vec::new();
+        let mut cookie_parts: Vec<String> = Vec::new();
 {%- for param in operation.params %}
 {%- if param.location == "Cookie" %}
 {%- if param.required %}
-    cookie_parts.push(format!("{}={}", "{{ param.name }}", {{ param.rust_name }}));
+{%- if param.is_display %}
+        cookie_parts.push(format!("{}={}", "{{ param.name }}", self.{{ param.rust_name }}));
 {%- else %}
-    if let Some(value) = {{ param.rust_name }} {
-        cookie_parts.push(format!("{}={}", "{{ param.name }}", value));
-    }
+        let encoded = serde_json::to_string(&self.{{ param.rust_name }})?;
+        cookie_parts.push(format!("{}={}", "{{ param.name }}", encoded));
+{%- endif %}
+{%- else %}
+        if let Some(value) = self.{{ param.rust_name }} {
+{%- if param.is_display %}
+            cookie_parts.push(format!("{}={}", "{{ param.name }}", value));
+{%- else %}
+            let encoded = serde_json::to_string(&value)?;
+            cookie_parts.push(format!("{}={}", "{{ param.name }}", encoded));
+{%- endif %}
+        }
 {%- endif %}
 {%- endif %}
 {%- endfor %}
-    if !cookie_parts.is_empty() {
-        if let Ok(value) = HeaderValue::from_str(&cookie_parts.join("; ")) {
-            req.headers_mut().insert(COOKIE, value);
+        if !cookie_parts.is_empty() {
+            if let Ok(value) = HeaderValue::from_str(&cookie_parts.join("; ")) {
+                req.headers_mut().insert(COOKIE, value);
+            }
         }
-    }
 {%- endif %}
 
 {%- if operation.request_body %}
 {%- if operation.request_body.required %}
-    let body_bytes = serde_json::to_vec(&body)?;
-    *req.body_mut() = Some(body_bytes.into());
-    req.headers_mut()
-        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-{%- else %}
-    if let Some(body) = body {
-        let body_bytes = serde_json::to_vec(&body)?;
+        let body_bytes = serde_json::to_vec(&self.body)?;
         *req.body_mut() = Some(body_bytes.into());
-        req.headers_mut()
-            .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    }
+        req.headers_mut().insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("{{ operation.request_body.content_type }}"),
+        );
+{%- else %}
+        if let Some(body) = self.body {
+            let body_bytes = serde_json::to_vec(&body)?;
+            *req.body_mut() = Some(body_bytes.into());
+            req.headers_mut().insert(
+                CONTENT_TYPE,
+                HeaderValue::from_static("{{ operation.request_body.content_type }}"),
+            );
+        }
 {%- endif %}
 {%- endif %}
 
-    let resp = client.send(req).await?;
-    let status = resp.status().as_u16();
-    let body = resp.bytes().await?;
-    parse_response_{{ operation.id }}(status, body.as_ref())
+        let resp = self.client.send(req).await?;
+        let status = resp.status().as_u16();
+        let body = resp.bytes().await?;
+        parse_response_{{ operation.id }}(status, body.as_ref())
+    }
 }
 
 fn parse_response_{{ operation.id }}(
@@ -190,7 +317,13 @@ fn parse_response_{{ operation.id }}(
 {%- for variant in operation.response_enum.variants %}
 {%- if not variant.is_default %}
         {{ variant.status_match }} => {
+{%- if variant.parse_mode == "Json" %}
             let parsed: {{ variant.render_type }} = serde_json::from_slice(body)?;
+{%- elif variant.parse_mode == "Bytes" %}
+            let parsed: {{ variant.render_type }} = body.to_vec();
+{%- else %}
+            let parsed: {{ variant.render_type }} = ();
+{%- endif %}
             Ok({{ operation.response_enum.name }}::{{ variant.name }}(parsed))
         }
 {%- endif %}
@@ -199,7 +332,13 @@ fn parse_response_{{ operation.id }}(
 {%- if operation.response_enum.has_default %}
 {%- for variant in operation.response_enum.variants %}
 {%- if variant.is_default %}
+{%- if variant.parse_mode == "Json" %}
             let parsed: {{ variant.render_type }} = serde_json::from_slice(body)?;
+{%- elif variant.parse_mode == "Bytes" %}
+            let parsed: {{ variant.render_type }} = body.to_vec();
+{%- else %}
+            let parsed: {{ variant.render_type }} = ();
+{%- endif %}
             Ok({{ operation.response_enum.name }}::{{ variant.name }}(parsed))
 {%- endif %}
 {%- endfor %}

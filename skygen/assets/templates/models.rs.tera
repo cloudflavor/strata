@@ -15,8 +15,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-{%- if model.dep_imports is defined and model.dep_imports | length > 0 %}
-{%- for imp in model.dep_imports %}
+{%- if dep_imports is defined and dep_imports | length > 0 %}
+{%- for imp in dep_imports %}
 {%- if imp.types | length > 1 %}
 use crate::models::{{ imp.module }}::{{ "{" }}{% for dep in imp.types %}{{ dep }}{% if not loop.last %}, {% endif %}{% endfor %}{{ "}" }};
 {%- else %}
@@ -24,13 +24,14 @@ use crate::models::{{ imp.module }}::{{ imp.types | first }};
 {%- endif %}
 {%- endfor %}
 {%- endif %}
-{%- if model.kind.Struct is defined or model.kind.Composite is defined %}
+{%- if uses_serde %}
 use serde::{Deserialize, Serialize};
-{%- if model.kind.Composite is defined and model.kind.Composite.flavor != "AllOf" %}
+{%- endif %}
+{%- if uses_serde_json_value %}
 use serde_json::Value as SerdeJsonValue;
 {%- endif %}
-{%- endif %}
 
+{% for model in models %}
 {% if model.kind.Struct is defined %}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct {{ model.rust_name | default(value=model.name) }} {
@@ -62,3 +63,5 @@ crate::serde_union!(
 {% else %}
 pub type {{ model.rust_name | default(value=model.name) }} = {{ model.render_type | default(value="serde_json::Value") }};
 {% endif %}
+
+{% endfor %}
