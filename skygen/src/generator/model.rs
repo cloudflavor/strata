@@ -462,9 +462,9 @@ impl ModelGenerator {
         fields: Option<&BTreeSet<String>>,
         typed_fields: Option<&BTreeSet<String>>,
         existing: &mut indexmap::IndexSet<String>,
-        name_to_sig: &HashMap<String, String>,
-        name_to_fields: &HashMap<String, BTreeSet<String>>,
-        name_to_typed_fields: &HashMap<String, BTreeSet<String>>,
+        name_to_sig: &mut HashMap<String, String>,
+        name_to_fields: &mut HashMap<String, BTreeSet<String>>,
+        name_to_typed_fields: &mut HashMap<String, BTreeSet<String>>,
     ) -> String {
         let mut base = parent_name.to_string();
         if let Some(field) = field_name {
@@ -563,20 +563,65 @@ impl ModelGenerator {
                     .get(&base)
                     .map(|s| s.as_str())
                     .unwrap_or_default(),
-                "inline model name collision has no unique fields"
+                "inline model name collision has no unique fields, trying field-based suffix"
             );
-            panic!(
-                "inline model name collision for '{base}': no unique fields to disambiguate; rename schema"
+            
+            // Final attempt: use first unique field as suffix (like operation generator)
+            if let (Some(current_fields_ref), Some(existing_fields_ref)) = (fields, name_to_fields.get(&base)) {
+                if let Some(suffix) = get_first_unique_field_suffix(current_fields_ref, existing_fields_ref) {
+                    let candidate = format!("{base}_{suffix}");
+                    if !existing.contains(&candidate) {
+                        existing.insert(candidate.clone());
+                        name_to_sig.insert(candidate.clone(), signature.to_string());
+                        name_to_fields.insert(candidate.clone(), current_fields_ref.clone());
+                        if let Some(typed_fields_ref) = typed_fields {
+                            name_to_typed_fields.insert(candidate.clone(), typed_fields_ref.clone());
+                        }
+                        return candidate;
+                    }
+                }
+            }
+            
+            // Fallback for structurally identical models: use a counter
+            tracing::debug!(
+                base = %base,
+                "inline model name collision: models are structurally identical, using counter fallback"
             );
+            
+            let mut counter = 1;
+            loop {
+                let candidate = format!("{base}_{counter}");
+                if !existing.contains(&candidate) {
+                    existing.insert(candidate.clone());
+                    name_to_sig.insert(candidate.clone(), signature.to_string());
+                    if let Some(fields_ref) = fields {
+                        name_to_fields.insert(candidate.clone(), fields_ref.clone());
+                    }
+                    if let Some(typed_fields_ref) = typed_fields {
+                        name_to_typed_fields.insert(candidate.clone(), typed_fields_ref.clone());
+                    }
+                    return candidate;
+                }
+                counter += 1;
+            }
         }
         tracing::debug!(
             base = %base,
             current_sig = %signature,
-            "inline model name collision has no field context"
+            "inline model name collision has no field context, trying simple counter fallback"
         );
-        panic!(
-            "inline model name collision for '{base}': no field context to disambiguate; rename schema"
-        );
+        
+        // Fallback for models without field context - use simple counter
+        let mut counter = 1;
+        loop {
+            let candidate = format!("{base}_{counter}");
+            if !existing.contains(&candidate) {
+                existing.insert(candidate.clone());
+                name_to_sig.insert(candidate.clone(), signature.to_string());
+                return candidate;
+            }
+            counter += 1;
+        }
     }
 
     /// Recompute render_type for each model and its fields.
@@ -1627,6 +1672,37 @@ fn candidate_suffixes(unique_fields: &BTreeSet<String>) -> Vec<String> {
     out
 }
 
+/// Get the first unique field name to use as a suffix for disambiguation.
+/// Similar to the operation generator's approach for handling naming conflicts.
+fn get_first_unique_field_suffix(
+    current_fields: &BTreeSet<String>,
+    existing_fields: &BTreeSet<String>,
+) -> Option<String> {
+    let unique: BTreeSet<String> = current_fields
+        .difference(existing_fields)
+        .cloned()
+        .collect();
+    if unique.is_empty() {
+        return None;
+    }
+    let mut candidates: BTreeSet<String> = BTreeSet::new();
+    for field in unique {
+        let sanitized = sanitize_module_name(&field);
+        if sanitized.is_empty() {
+            continue;
+        }
+        for token in sanitized.split('_') {
+            if !token.is_empty() {
+                candidates.insert(token.to_string());
+            }
+        }
+        candidates.insert(sanitized);
+    }
+    let mut out: Vec<String> = candidates.into_iter().collect();
+    out.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
+    out.into_iter().next()
+}
+
 /// Collect referenced model dependencies for a ModelDef.
 /// Sorted for stable output.
 fn collect_model_deps(model: &ModelDef) -> Vec<String> {
@@ -1720,6 +1796,35 @@ pub fn sanitize_type_name(name: &str) -> String {
     }
 }
 
+/// Convert a number prefix to its word equivalent.
+/// Used to make module names more readable when they start with numbers.
+fn number_prefix_to_word(name: &str) -> String {
+    if let Some(first_char) = name.chars().next() {
+        if first_char.is_ascii_digit() {
+            // Extract the numeric prefix
+            let num_end = name.chars().take_while(|c| c.is_ascii_digit()).count();
+            let (num_part, rest) = name.split_at(num_end);
+            
+            // Convert number to word
+            let word = match num_part {
+                "1" => "one",
+                "2" => "two",
+                "3" => "three",
+                "4" => "four",
+                "5" => "five",
+                "6" => "six",
+                "7" => "seven",
+                "8" => "eight",
+                "9" => "nine",
+                "10" => "ten",
+                _ => "num", // Fallback for larger numbers
+            };
+            return format!("{}{}", word, rest);
+        }
+    }
+    name.to_string()
+}
+
 /// Sanitize a schema name into a Rust module file name.
 /// Lowercases, replaces separators, and trims underscores.
 pub fn sanitize_module_name(name: &str) -> String {
@@ -1736,8 +1841,13 @@ pub fn sanitize_module_name(name: &str) -> String {
         out = out.replace("__", "_");
     }
     out = out.trim_matches('_').to_string();
+    
+    // Convert numbers to words for better readability
+    // This ensures valid Rust module names (can't start with numbers)
     if out.is_empty() {
         "_".into()
+    } else if out.chars().next().unwrap().is_ascii_digit() {
+        number_prefix_to_word(&out)
     } else {
         out
     }
@@ -2562,6 +2672,8 @@ mod tests {
         let mut name_to_sig = HashMap::new();
         let mut sig_to_name = HashMap::new();
 
+        let mut name_to_fields = HashMap::new();
+        let mut name_to_typed_fields = HashMap::new();
         let changed = generator
             .hoist_in_type(
                 "Container",
@@ -2571,6 +2683,8 @@ mod tests {
                 &mut existing,
                 &mut name_to_sig,
                 &mut sig_to_name,
+                &mut name_to_fields,
+                &mut name_to_typed_fields,
             )
             .expect("hoist");
         assert!(changed);
@@ -2589,18 +2703,21 @@ mod tests {
         existing.insert("container_inner".into());
         let mut name_to_sig = HashMap::new();
         name_to_sig.insert("container_inner".into(), "sig".into());
-        let name_to_fields: HashMap<String, BTreeSet<String>> = HashMap::new();
-        let name_to_typed_fields: HashMap<String, BTreeSet<String>> = HashMap::new();
+        let mut name_to_fields: HashMap<String, BTreeSet<String>> = HashMap::new();
+        let mut name_to_typed_fields: HashMap<String, BTreeSet<String>> = HashMap::new();
+        let fields: Option<&BTreeSet<String>> = None;
+        let typed_fields: Option<&BTreeSet<String>> = None;
         let name = generator.inline_model_name(
             "Container",
             Some("inner"),
             false,
             "sig",
-            None,
+            fields,
+            typed_fields,
             &mut existing,
-            &name_to_sig,
-            &name_to_fields,
-            &name_to_typed_fields,
+            &mut name_to_sig,
+            &mut name_to_fields,
+            &mut name_to_typed_fields,
         );
         assert_eq!(name, "container_inner");
     }
@@ -3138,6 +3255,17 @@ mod tests {
     #[test]
     fn sanitize_module_name_trims_and_collapses() {
         assert_eq!(sanitize_module_name("__A--"), "a");
+    }
+
+    /// Ensure sanitize_module_name converts numbers to words.
+    #[test]
+    fn sanitize_module_name_converts_numbers_to_words() {
+        assert_eq!(sanitize_module_name("1-click"), "one_click");
+        assert_eq!(sanitize_module_name("2fa"), "twofa");
+        assert_eq!(sanitize_module_name("3_test"), "three_test");
+        assert_eq!(sanitize_module_name("10_items"), "ten_items");
+        assert_eq!(sanitize_module_name("123test"), "numtest"); // Fallback for larger numbers
+        assert_eq!(sanitize_module_name("normal_name"), "normal_name");
     }
 
     /// Ensure sanitize_module_name_disambiguated encodes separators.

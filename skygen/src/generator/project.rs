@@ -576,6 +576,7 @@ mod tests {
                 content_type: Some("application/json".into()),
                 typ: ModelType::Primitive(PrimitiveType::String),
                 render_type: "String".into(),
+                parse_mode: crate::generator::operation::ResponseParseMode::Json,
             }],
             response_enum: OperationResponseEnum {
                 name: "GetTestResponse".into(),
@@ -585,12 +586,15 @@ mod tests {
                     render_type: "String".into(),
                     status_match: "200".into(),
                     is_default: false,
+                    parse_mode: crate::generator::operation::ResponseParseMode::Json,
                 }],
                 has_default: false,
             },
             deps: Vec::new(),
             dep_imports: Vec::new(),
             group: "default".into(),
+            builder_name: "get_test".into(),
+            short_name: "get_test".into(),
             params: vec![OperationParam {
                 name: "id".into(),
                 rust_name: "id".into(),
@@ -599,8 +603,21 @@ mod tests {
                 typ: ModelType::Primitive(PrimitiveType::String),
                 render_type: "String".into(),
                 is_array: false,
+                is_display: false,
                 array_item_is_primitive: false,
             }],
+            required_params: vec![OperationParam {
+                name: "id".into(),
+                rust_name: "id".into(),
+                location: OperationParamLocation::Path,
+                required: true,
+                typ: ModelType::Primitive(PrimitiveType::String),
+                render_type: "String".into(),
+                is_array: false,
+                is_display: false,
+                array_item_is_primitive: false,
+            }],
+            optional_params: Vec::new(),
             has_path_params: true,
             has_query_params: false,
             has_header_params: false,
@@ -612,11 +629,14 @@ mod tests {
         ctx.insert("uses_cookie_header", &false);
         ctx.insert("uses_content_type", &false);
         ctx.insert("uses_error_types", &true);
+        ctx.insert("service_name", &"TestService");
+        ctx.insert("service_method", &"get");
         let data = tera
             .render("templates/operations.rs.tera", &ctx)
             .expect("render");
-        assert!(data.contains("client: &Client"));
-        assert!(data.contains("parse_response"));
+        // println!("Rendered data: {}", data);
+        assert!(data.contains("client: &'a Client"));
+        assert!(data.contains("parse_response_get_test"));
         assert!(data.contains("reqwest::Request::new"));
     }
 }
