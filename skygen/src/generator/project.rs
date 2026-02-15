@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::generator::model::ModelRegistry;
+use crate::generator::model::{sanitize_type_name, DepImport, ModelDef, ModelRegistry};
 use crate::generator::operation::OperationRegistry;
 use crate::Config;
 use anyhow::{Context, Result};
 use indexmap::{IndexMap, IndexSet};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
 use taplo::formatter;
@@ -102,6 +102,7 @@ pub async fn bootstrap_lib(
         "templates/cargo.toml.tera",
         "templates/operations.rs.tera",
         "templates/model.rs.tera",
+        "templates/models.rs.tera",
         "templates/aliases.rs.tera",
         "templates/lib.rs.tera",
         "templates/mod.rs.tera",
@@ -115,6 +116,9 @@ pub async fn bootstrap_lib(
     // Render main project files
     let mut models_mod_ctx = TeraContext::new();
     models_mod_ctx.insert("is_models_mod", &true);
+
+    let mut apis_mod_ctx = TeraContext::new();
+    apis_mod_ctx.insert("export_glob", &false);
 
     let main_plans = [
         RenderPlan {
@@ -130,7 +134,7 @@ pub async fn bootstrap_lib(
         RenderPlan {
             template: "templates/mod.rs.tera",
             out_rel: "src/apis/mod.rs".to_string(),
-            extra_ctx: None,
+            extra_ctx: Some(apis_mod_ctx),
         },
         RenderPlan {
             template: "templates/mod.rs.tera",
@@ -158,89 +162,104 @@ pub async fn bootstrap_lib(
 
     write_static_files(out_dir.as_ref(), &rs_files).await?;
 
-    // Generate model files
+    // Generate model files grouped by operation tag
     let mut models: Vec<RenderPlan> = Vec::new();
-    let mut mods: Vec<String> = Vec::new();
-    let mut type_map = registry.type_map.clone();
-    let mut alias_models = Vec::new();
+    let mut type_map: HashMap<String, String> = HashMap::new();
+    let mut model_deps: HashMap<String, Vec<String>> = HashMap::new();
+    let mut group_names: HashSet<String> = HashSet::new();
 
-    let mut alias_rust_names: Vec<String> = Vec::new();
+    for op in ops.ops.values() {
+        group_names.insert(op.group.clone());
+    }
+
     for model in registry.models.values() {
-        if !matches!(
-            model.kind,
-            crate::generator::model::ModelType::Struct(_)
-                | crate::generator::model::ModelType::Composite(_)
-        ) {
-            alias_rust_names.push(model.rust_name.clone());
+        model_deps.insert(model.rust_name.clone(), model.deps.clone());
+    }
+
+    let shared_module = choose_shared_module(&group_names, &registry);
+
+    let mut groups_by_model: HashMap<String, indexmap::IndexSet<String>> = HashMap::new();
+    for op in ops.ops.values() {
+        let group = op.group.clone();
+        let mut stack: Vec<String> = op.deps.clone();
+        let mut seen: HashSet<String> = HashSet::new();
+        while let Some(dep) = stack.pop() {
+            if !seen.insert(dep.clone()) {
+                continue;
+            }
+            groups_by_model
+                .entry(dep.clone())
+                .or_default()
+                .insert(group.clone());
+            if let Some(next) = model_deps.get(&dep) {
+                for child in next {
+                    stack.push(child.clone());
+                }
+            }
         }
     }
 
-    let alias_module = if !alias_rust_names.is_empty() {
-        let mut candidate = "aliases".to_string();
-        if registry.models.contains_key(&candidate) {
-            candidate = "model_aliases".to_string();
-        }
-        if registry.models.contains_key(&candidate) {
-            candidate = "type_aliases".to_string();
-        }
-        Some(candidate)
-    } else {
-        None
-    };
+    let mut model_module_by_rust: HashMap<String, String> = HashMap::new();
+    for model in registry.models.values() {
+        let module = match groups_by_model.get(&model.rust_name) {
+            Some(groups) if groups.len() == 1 => groups.iter().next().unwrap().to_string(),
+            _ => shared_module.clone(),
+        };
+        model_module_by_rust.insert(model.rust_name.clone(), module);
+    }
 
-    if let Some(module_name) = alias_module.as_ref() {
-        for rust_name in &alias_rust_names {
-            type_map.insert(rust_name.clone(), module_name.clone());
+    for model in registry.models.values() {
+        if let Some(module) = model_module_by_rust.get(&model.rust_name) {
+            type_map.insert(model.rust_name.clone(), module.clone());
         }
     }
 
-    for (name, mut model) in registry.models.into_iter() {
+    let mut models_by_module: IndexMap<String, Vec<crate::generator::model::ModelDef>> =
+        IndexMap::new();
+    for (_name, mut model) in registry.models.into_iter() {
         model.dep_imports =
             crate::generator::model::group_dep_imports(&model.deps, &type_map);
-        match model.kind {
-            crate::generator::model::ModelType::Struct(_)
-            | crate::generator::model::ModelType::Composite(_) => {
-                mods.push(name.clone());
-                let mut model_ctx = TeraContext::new();
-                let out_file = format!("src/models/{name}.rs");
-                model_ctx.insert("model", &model);
-
-                models.push(RenderPlan {
-                    template: "templates/model.rs.tera",
-                    out_rel: out_file,
-                    extra_ctx: Some(model_ctx),
-                });
-            }
-            _ => {
-                alias_models.push(model);
-            }
-        }
+        let module = model_module_by_rust
+            .get(&model.rust_name)
+            .cloned()
+            .unwrap_or_else(|| shared_module.clone());
+        models_by_module.entry(module).or_default().push(model);
     }
 
-    if let (Some(alias_module), true) = (alias_module, !alias_models.is_empty()) {
+    let mut mods: Vec<String> = models_by_module.keys().cloned().collect();
+    mods.sort();
 
-        let mut alias_ctx = TeraContext::new();
-        alias_ctx.insert("aliases", &alias_models);
+    for module in &mods {
+        if let Some(group_models) = models_by_module.get_mut(module) {
+            group_models.sort_by(|a, b| a.rust_name.cmp(&b.rust_name));
+            let dep_imports = merge_model_imports(group_models, module);
+            let uses_serde = group_models.iter().any(|model| {
+                matches!(
+                    model.kind,
+                    crate::generator::model::ModelType::Struct(_)
+                        | crate::generator::model::ModelType::Composite(_)
+                )
+            });
+            let uses_serde_json_value = group_models.iter().any(|model| match model.kind {
+                crate::generator::model::ModelType::Composite(ref comp) => {
+                    !matches!(comp.flavor, crate::generator::model::CompositeFlavor::AllOf)
+                }
+                _ => false,
+            });
 
-        let mut alias_deps = indexmap::IndexSet::new();
-        for model in &alias_models {
-            for dep in &model.deps {
-                alias_deps.insert(dep.clone());
-            }
+            let mut model_ctx = TeraContext::new();
+            model_ctx.insert("models", &group_models);
+            model_ctx.insert("dep_imports", &dep_imports);
+            model_ctx.insert("uses_serde", &uses_serde);
+            model_ctx.insert("uses_serde_json_value", &uses_serde_json_value);
+
+            let out_file = format!("src/models/{module}.rs");
+            models.push(RenderPlan {
+                template: "templates/models.rs.tera",
+                out_rel: out_file,
+                extra_ctx: Some(model_ctx),
+            });
         }
-        let mut alias_deps: Vec<String> = alias_deps.into_iter().collect();
-        alias_deps.sort();
-        let dep_imports =
-            crate::generator::model::group_dep_imports(&alias_deps, &type_map);
-        alias_ctx.insert("dep_imports", &dep_imports);
-
-        let out_file = format!("src/models/{alias_module}.rs");
-        models.push(RenderPlan {
-            template: "templates/aliases.rs.tera",
-            out_rel: out_file,
-            extra_ctx: Some(alias_ctx),
-        });
-        mods.push(alias_module);
     }
 
     // Add module context for models
@@ -307,6 +326,9 @@ pub async fn bootstrap_lib(
         group_ctx.insert("uses_cookie_header", &uses_cookie_header);
         group_ctx.insert("uses_content_type", &uses_content_type);
         group_ctx.insert("uses_error_types", &uses_error_types);
+        let service_name = format!("{}Service", sanitize_type_name(group));
+        group_ctx.insert("service_name", &service_name);
+        group_ctx.insert("service_method", group);
 
         ops_plans.push(RenderPlan {
             template: "templates/operations.rs.tera",
@@ -317,6 +339,7 @@ pub async fn bootstrap_lib(
 
     let mut api_mods_ctx = TeraContext::new();
     api_mods_ctx.insert("modules", &top_modules);
+    api_mods_ctx.insert("export_glob", &false);
     ops_plans.push(RenderPlan {
         template: "templates/mod.rs.tera",
         out_rel: "src/apis/mod.rs".to_string(),
@@ -350,6 +373,48 @@ pub fn load_templates(names: &[&str]) -> Result<Tera> {
         )?;
     }
     Ok(tera)
+}
+
+fn choose_shared_module(group_names: &HashSet<String>, registry: &ModelRegistry) -> String {
+    let mut reserved: HashSet<String> = group_names.clone();
+    for name in registry.models.keys() {
+        reserved.insert(name.clone());
+    }
+    for candidate in [
+        "shared",
+        "common",
+        "shared_models",
+        "common_models",
+        "shared_types",
+        "common_types",
+    ] {
+        if !reserved.contains(candidate) {
+            return candidate.to_string();
+        }
+    }
+    panic!("no available shared module name for grouped models");
+}
+
+fn merge_model_imports(models: &[ModelDef], module: &str) -> Vec<DepImport> {
+    let mut grouped: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for model in models {
+        for imp in &model.dep_imports {
+            if imp.module == module {
+                continue;
+            }
+            let entry = grouped.entry(imp.module.clone()).or_default();
+            for ty in &imp.types {
+                entry.insert(ty.clone());
+            }
+        }
+    }
+    grouped
+        .into_iter()
+        .map(|(module, types)| DepImport {
+            module,
+            types: types.into_iter().collect(),
+        })
+        .collect()
 }
 
 /// Filter to sanitize module names for use in Rust imports
