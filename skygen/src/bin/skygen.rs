@@ -67,14 +67,18 @@ async fn main() -> anyhow::Result<()> {
                 .with_context(|| "failed to resolve schema")?;
 
             let mut generator = ModelGenerator::new();
-            let registry = generator
+            let mut registry = generator
                 .collect_models(&resolved)
                 .with_context(|| "failed to collect models")?;
 
             let op_generator = OperationGenerator::new();
             let ops = op_generator
-                .collect_operations(&resolved, &registry)
+                .collect_operations(&resolved, &mut registry)
                 .with_context(|| "failed to collect operations")?;
+
+            generator
+                .finalize_registry(&mut registry)
+                .with_context(|| "failed to finalize models")?;
 
             bootstrap_lib(&config, registry, ops, &args.output)
                 .await
