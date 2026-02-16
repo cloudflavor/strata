@@ -54,6 +54,11 @@ impl Client {
 
 impl<'a> {{ service_name }}<'a> {
 {%- for operation in operations %}
+{%- if operation.documentation is defined and operation.documentation %}
+    {{ operation.documentation | safe }}
+{%- else %}
+    /// {{ operation.description | default("API operation: " ~ operation.name) | safe }}
+{%- endif %}
     pub fn {{ operation.short_name }}(&'a self
 {%- for param in operation.required_params %}
         , {{ param.rust_name }}: {{ param.render_type }}
@@ -141,6 +146,18 @@ impl<'a> {{ operation.builder_name }}<'a> {
     }
 
 {%- endif %}
+    /// Executes the API request and returns the response
+    ///
+    /// # Returns
+    ///
+    /// Returns a `Result` with the response enum that contains variants for each possible status code:
+    /// {% for variant in operation.response_enum.variants -%}
+    /// - `{{ variant.name }}`: {{ variant.status_match }} - {{ variant.render_type }}
+    /// {% endfor -%}
+    ///
+    /// # Errors
+    ///
+    /// Returns an `Error` if the API request fails or the response cannot be parsed
     pub async fn send(self) -> Result<{{ operation.response_enum.name }}> {
 {%- if operation.has_path_params %}
         let mut endpoint_path = "{{ operation.path }}".to_string();

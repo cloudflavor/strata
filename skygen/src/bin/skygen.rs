@@ -158,6 +158,13 @@ async fn generate_operation_documentation(
         }
     );
     
+    // Verify the documentation was stored
+    if let Some(stored_doc) = &op.documentation {
+        tracing::debug!("✅ Documentation stored successfully, length: {}", stored_doc.len());
+    } else {
+        tracing::error!("❌ Documentation was not stored properly!");
+    }
+    
     Ok(())
 }
 
