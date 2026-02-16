@@ -299,7 +299,7 @@ pub async fn bootstrap_lib(
 
         for op in group_ops {
             for dep in &op.deps {
-                deps.insert(dep.clone());
+                deps.insert(dep.to_string());
             }
             if op.has_header_params || op.has_cookie_params || op.request_body.is_some() {
                 uses_header_value = true;

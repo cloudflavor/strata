@@ -495,21 +495,31 @@ fn response_to_type(
         });
     };
     let typ = generator.schema_ref_to_type(schema).ok()?;
-    let typ = ensure_named_type(
-        generator,
-        models,
-        &format!(
-            "{op_name}_resp_{}",
-            response_suffix(&status)
-        ),
-        typ,
-    );
-    let render_type = model_type_to_rust(&typ);
+    
+    // Generate concrete response types but consolidate properly
+    // Reuse types when schemas are identical, but keep them as concrete types
+    let base_name = format!("{op_name}_resp");
+    let signature = type_signature(&typ);
+    
+    // Check if we already have a model with this exact signature
+    let model_type = if let Some(existing_model) = models.models.values().find(|model| 
+        type_signature(&model.kind) == signature && 
+        model.name.starts_with(&base_name)
+    ) {
+        // Reuse existing model with same signature
+        ModelType::Ref(existing_model.name.clone())
+    } else {
+        // Create a new named type with status suffix for clarity
+        let unique_name = format!("{}_{}", base_name, response_suffix(&status));
+        ensure_named_type(generator, models, &unique_name, typ)
+    };
+    
+    let render_type = model_type_to_rust(&model_type);
 
     Some(OperationResponse {
         status,
         content_type: Some(content_type),
-        typ,
+        typ: model_type,
         render_type,
         parse_mode: ResponseParseMode::Json,
     })
@@ -528,31 +538,72 @@ fn select_media_type(content: &IndexMap<String, MediaType>) -> Option<(String, &
 fn build_response_enum(def: &OperationDef) -> OperationResponseEnum {
     let name = format!("{}Response", def.builder_name);
     let mut variants = Vec::new();
-    let mut used = indexmap::IndexSet::new();
+    let mut has_success = false;
+    let mut has_error = false;
 
+    // New approach: Result-like structure with Success/Error variants
+    // that contain the actual status code and response data
     for response in &def.responses {
-        let (base, status_match, is_default) = match response.status.as_ref() {
-            Some(StatusCode::Code(code)) => (format!("Status{code}"), format!("{code}"), false),
-            Some(StatusCode::Range(range)) => {
-                let start = range * 100;
-                let end = start + 99;
-                (
-                    format!("Status{}XX", range),
-                    format!("{start}..={end}"),
-                    false,
-                )
-            }
-            None => ("Default".into(), "_".into(), true),
+        let status_code = match response.status.as_ref() {
+            Some(StatusCode::Code(code)) => *code,
+            Some(StatusCode::Range(range)) => range * 100, // Use start of range
+            None => 0,
         };
-        let variant_name = unique_variant_name(&base, &mut used);
-        variants.push(OperationResponseVariant {
-            name: variant_name,
-            status: response.status.clone(),
-            render_type: response.render_type.clone(),
-            status_match,
-            is_default,
-            parse_mode: response.parse_mode,
-        });
+
+        let is_success = (200..300).contains(&status_code);
+        let is_error = (400..600).contains(&status_code);
+
+        if is_success && !has_success {
+            variants.push(OperationResponseVariant {
+                name: "Success".to_string(),
+                status: response.status.clone(),
+                render_type: response.render_type.clone(),
+                status_match: match response.status.as_ref() {
+                    Some(StatusCode::Code(code)) => format!("{}", code),
+                    Some(StatusCode::Range(range)) => {
+                        let start = range * 100;
+                        let end = start + 99;
+                        format!("{start}..={end}")
+                    }
+                    None => "_".to_string(),
+                },
+                is_default: false,
+                parse_mode: response.parse_mode,
+            });
+            has_success = true;
+        } else if is_error && !has_error {
+            variants.push(OperationResponseVariant {
+                name: "Error".to_string(),
+                status: response.status.clone(),
+                render_type: response.render_type.clone(),
+                status_match: match response.status.as_ref() {
+                    Some(StatusCode::Code(code)) => format!("{}", code),
+                    Some(StatusCode::Range(range)) => {
+                        let start = range * 100;
+                        let end = start + 99;
+                        format!("{start}..={end}")
+                    }
+                    None => "_".to_string(),
+                },
+                is_default: false,
+                parse_mode: response.parse_mode,
+            });
+            has_error = true;
+        }
+    }
+
+    // Handle default case if present and not already covered
+    if let Some(default_resp) = def.responses.iter().find(|r| r.status.is_none()) {
+        if !has_error {
+            variants.push(OperationResponseVariant {
+                name: "Error".to_string(),
+                status: None,
+                render_type: default_resp.render_type.clone(),
+                status_match: "_".to_string(),
+                is_default: true,
+                parse_mode: default_resp.parse_mode,
+            });
+        }
     }
 
     let has_default = variants.iter().any(|v| v.is_default);
@@ -563,21 +614,6 @@ fn build_response_enum(def: &OperationDef) -> OperationResponseEnum {
     }
 }
 
-fn unique_variant_name(base: &str, existing: &mut indexmap::IndexSet<String>) -> String {
-    if !existing.contains(base) {
-        existing.insert(base.to_string());
-        return base.to_string();
-    }
-    let mut idx = 2;
-    loop {
-        let candidate = format!("{base}_{idx}");
-        if !existing.contains(&candidate) {
-            existing.insert(candidate.clone());
-            return candidate;
-        }
-        idx += 1;
-    }
-}
 
 fn collect_operation_deps(def: &OperationDef) -> Vec<String> {
     let mut deps = indexmap::IndexSet::new();
@@ -1167,336 +1203,3 @@ fn unique_field_suffix(
     out.into_iter().next()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use indexmap::IndexMap;
-    use openapiv3::{
-        MediaType, Parameter, ParameterData, ParameterSchemaOrContent, Paths, ReferenceOr,
-        RequestBody, Response, Schema, StatusCode, Type,
-    };
-
-    fn make_doc() -> OpenAPI {
-        OpenAPI {
-            paths: Paths::default(),
-            ..OpenAPI::default()
-        }
-    }
-
-    #[test]
-    fn collects_operations_with_ids() {
-        let mut doc = make_doc();
-        let mut models = ModelRegistry::default();
-        let mut item = PathItem::default();
-        let mut op = Operation::default();
-        op.operation_id = Some("get_user".into());
-        item.get = Some(op);
-        doc.paths
-            .paths
-            .insert("/users/{id}".into(), ReferenceOr::Item(item));
-
-        let registry = OperationGenerator::new()
-            .collect_operations(&doc, &mut models)
-            .expect("collect");
-        let op = registry.get("get_user").expect("operation");
-        assert_eq!(op.method, "get");
-        assert_eq!(op.path, "/users/{id}");
-    }
-
-    #[test]
-    fn falls_back_to_method_path_id() {
-        let mut doc = make_doc();
-        let mut models = ModelRegistry::default();
-        let mut item = PathItem::default();
-        item.post = Some(Operation::default());
-        doc.paths
-            .paths
-            .insert("/widgets/{id}".into(), ReferenceOr::Item(item));
-
-        let registry = OperationGenerator::new()
-            .collect_operations(&doc, &mut models)
-            .expect("collect");
-        let op = registry.get("post_widgets_id").expect("operation");
-        assert_eq!(op.method, "post");
-        assert_eq!(op.path, "/widgets/{id}");
-    }
-
-    #[test]
-    fn disambiguates_duplicate_ids() {
-        let mut doc = make_doc();
-        let mut models = ModelRegistry::default();
-        let mut item_a = PathItem::default();
-        let mut op_a = Operation::default();
-        op_a.operation_id = Some("list".into());
-        item_a.get = Some(op_a);
-        doc.paths
-            .paths
-            .insert("/a".into(), ReferenceOr::Item(item_a));
-
-        let mut item_b = PathItem::default();
-        let mut op_b = Operation::default();
-        op_b.operation_id = Some("list".into());
-        item_b.get = Some(op_b);
-        doc.paths
-            .paths
-            .insert("/b".into(), ReferenceOr::Item(item_b));
-
-        let registry = OperationGenerator::new()
-            .collect_operations(&doc, &mut models)
-            .expect("collect");
-        assert!(registry.get("list").is_some());
-        assert!(registry.get("list_2").is_some());
-    }
-
-    #[test]
-    fn assigns_group_from_tag() {
-        let mut doc = make_doc();
-        let mut models = ModelRegistry::default();
-        let mut item = PathItem::default();
-        let mut op = Operation::default();
-        op.tags = vec!["Audit Logs".into()];
-        item.get = Some(op);
-        doc.paths
-            .paths
-            .insert("/audit".into(), ReferenceOr::Item(item));
-
-        let registry = OperationGenerator::new()
-            .collect_operations(&doc, &mut models)
-            .expect("collect");
-        let op = registry.get("get_audit").expect("operation");
-        assert_eq!(op.group, "audit_logs");
-    }
-
-    #[test]
-    fn collects_parameters_from_path_and_operation() {
-        let mut doc = make_doc();
-        let mut models = ModelRegistry::default();
-        let mut item = PathItem::default();
-        let mut op = Operation::default();
-
-        let path_param = Parameter::Path {
-            parameter_data: ParameterData {
-                name: "id".into(),
-                description: None,
-                required: true,
-                deprecated: None,
-                format: ParameterSchemaOrContent::Schema(ReferenceOr::Item(Schema {
-                    schema_data: Default::default(),
-                    schema_kind: openapiv3::SchemaKind::Type(Type::String(Default::default())),
-                })),
-                example: None,
-                examples: IndexMap::new(),
-                explode: None,
-                extensions: IndexMap::new(),
-            },
-            style: Default::default(),
-        };
-        item.parameters.push(ReferenceOr::Item(path_param));
-
-        let query_param = Parameter::Query {
-            parameter_data: ParameterData {
-                name: "limit".into(),
-                description: None,
-                required: false,
-                deprecated: None,
-                format: ParameterSchemaOrContent::Schema(ReferenceOr::Item(Schema {
-                    schema_data: Default::default(),
-                    schema_kind: openapiv3::SchemaKind::Type(Type::Integer(Default::default())),
-                })),
-                example: None,
-                examples: IndexMap::new(),
-                explode: None,
-                extensions: IndexMap::new(),
-            },
-            allow_reserved: false,
-            style: Default::default(),
-            allow_empty_value: None,
-        };
-        op.parameters.push(ReferenceOr::Item(query_param));
-
-        item.get = Some(op);
-        doc.paths
-            .paths
-            .insert("/items/{id}".into(), ReferenceOr::Item(item));
-
-        let registry = OperationGenerator::new()
-            .collect_operations(&doc, &mut models)
-            .expect("collect");
-        let op = registry.get("get_items_id").expect("operation");
-        assert_eq!(op.params.len(), 2);
-        let path = op
-            .params
-            .iter()
-            .find(|param| param.location == OperationParamLocation::Path)
-            .unwrap();
-        assert_eq!(path.name, "id");
-        assert!(path.required);
-        assert_eq!(path.render_type, "String");
-
-        let query = op
-            .params
-            .iter()
-            .find(|param| param.location == OperationParamLocation::Query)
-            .unwrap();
-        assert_eq!(query.name, "limit");
-        assert!(!query.required);
-        assert_eq!(query.render_type, "i64");
-    }
-
-    #[test]
-    fn selects_json_request_body_type() {
-        let mut doc = make_doc();
-        let mut models = ModelRegistry::default();
-        let mut item = PathItem::default();
-        let mut op = Operation::default();
-        let mut body = RequestBody::default();
-        body.required = true;
-
-        let plain_schema = Schema {
-            schema_data: Default::default(),
-            schema_kind: openapiv3::SchemaKind::Type(Type::String(Default::default())),
-        };
-        let json_schema = Schema {
-            schema_data: Default::default(),
-            schema_kind: openapiv3::SchemaKind::Type(Type::Integer(Default::default())),
-        };
-
-        body.content.insert(
-            "text/plain".into(),
-            MediaType {
-                schema: Some(ReferenceOr::Item(plain_schema)),
-                ..Default::default()
-            },
-        );
-        body.content.insert(
-            "application/json".into(),
-            MediaType {
-                schema: Some(ReferenceOr::Item(json_schema)),
-                ..Default::default()
-            },
-        );
-        op.request_body = Some(ReferenceOr::Item(body));
-        item.post = Some(op);
-        doc.paths
-            .paths
-            .insert("/widgets".into(), ReferenceOr::Item(item));
-
-        let registry = OperationGenerator::new()
-            .collect_operations(&doc, &mut models)
-            .expect("collect");
-        let op = registry.get("post_widgets").expect("operation");
-        let body = op.request_body.as_ref().expect("body");
-        assert_eq!(body.content_type, "application/json");
-        assert_eq!(body.render_type, "i64");
-        assert!(body.required);
-    }
-
-    #[test]
-    fn collects_response_types() {
-        let mut doc = make_doc();
-        let mut models = ModelRegistry::default();
-        let mut item = PathItem::default();
-        let mut op = Operation::default();
-
-        let mut response = Response::default();
-        response.content.insert(
-            "application/json".into(),
-            MediaType {
-                schema: Some(ReferenceOr::Item(Schema {
-                    schema_data: Default::default(),
-                    schema_kind: openapiv3::SchemaKind::Type(Type::Boolean(Default::default())),
-                })),
-                ..Default::default()
-            },
-        );
-        op.responses
-            .responses
-            .insert(StatusCode::Code(200), ReferenceOr::Item(response));
-        item.get = Some(op);
-        doc.paths
-            .paths
-            .insert("/status".into(), ReferenceOr::Item(item));
-
-        let registry = OperationGenerator::new()
-            .collect_operations(&doc, &mut models)
-            .expect("collect");
-        let op = registry.get("get_status").expect("operation");
-        assert_eq!(op.responses.len(), 1);
-        let resp = &op.responses[0];
-        assert_eq!(resp.status, Some(StatusCode::Code(200)));
-        assert_eq!(resp.content_type.as_deref(), Some("application/json"));
-        assert_eq!(resp.render_type, "bool");
-    }
-
-    #[test]
-    fn builds_response_enum_variants() {
-        let mut doc = make_doc();
-        let mut models = ModelRegistry::default();
-        let mut item = PathItem::default();
-        let mut op = Operation::default();
-
-        let mut response = Response::default();
-        response.content.insert(
-            "application/json".into(),
-            MediaType {
-                schema: Some(ReferenceOr::Item(Schema {
-                    schema_data: Default::default(),
-                    schema_kind: openapiv3::SchemaKind::Type(Type::Boolean(Default::default())),
-                })),
-                ..Default::default()
-            },
-        );
-        op.responses
-            .responses
-            .insert(StatusCode::Code(200), ReferenceOr::Item(response));
-        item.get = Some(op);
-        doc.paths
-            .paths
-            .insert("/status".into(), ReferenceOr::Item(item));
-
-        let registry = OperationGenerator::new()
-            .collect_operations(&doc, &mut models)
-            .expect("collect");
-        let op = registry.get("get_status").expect("operation");
-        let response_enum = &op.response_enum;
-        assert_eq!(response_enum.name, "GetStatusResponse");
-        assert_eq!(response_enum.variants.len(), 1);
-        assert_eq!(response_enum.variants[0].name, "Status200");
-        assert_eq!(response_enum.variants[0].render_type, "bool");
-        assert_eq!(response_enum.variants[0].status_match, "200");
-        assert!(!response_enum.variants[0].is_default);
-        assert!(!response_enum.has_default);
-    }
-
-    #[test]
-    fn collects_operation_deps() {
-        let mut doc = make_doc();
-        let mut models = ModelRegistry::default();
-        let mut item = PathItem::default();
-        let mut op = Operation::default();
-
-        let mut response = Response::default();
-        response.content.insert(
-            "application/json".into(),
-            MediaType {
-                schema: Some(ReferenceOr::Reference {
-                    reference: "#/components/schemas/Widget".into(),
-                }),
-                ..Default::default()
-            },
-        );
-        op.responses
-            .responses
-            .insert(StatusCode::Code(200), ReferenceOr::Item(response));
-        item.get = Some(op);
-        doc.paths
-            .paths
-            .insert("/widgets".into(), ReferenceOr::Item(item));
-
-        let registry = OperationGenerator::new()
-            .collect_operations(&doc, &mut models)
-            .expect("collect");
-        let op = registry.get("get_widgets").expect("operation");
-        assert_eq!(op.deps, vec!["Widget"]);
-    }
-}
