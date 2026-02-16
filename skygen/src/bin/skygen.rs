@@ -185,9 +185,36 @@ async fn generate_operation_documentation(
         original_op.description
     );
 
-    tracing::debug!("OpenAPI spec for this operation:\n{}", openapi_spec);
+    // Generate the Rust function signature for the AI to use in examples
+    let mut param_signatures = Vec::new();
+    for param in &op.required_params {
+        param_signatures.push(format!("{}: {}", param.rust_name, param.render_type));
+    }
+    
+    let mut optional_param_signatures = Vec::new();
+    for param in &op.optional_params {
+        optional_param_signatures.push(format!("{}: Option<{}>", param.rust_name, param.render_type));
+    }
+    
+    let rust_function_signature = if !param_signatures.is_empty() || !optional_param_signatures.is_empty() {
+        let all_params = [param_signatures, optional_param_signatures].concat();
+        format!("pub fn {}({}) -> {} {{ /* implementation */ }}", 
+            op.name,
+            all_params.join(", "),
+            op.response_enum.name
+        )
+    } else {
+        format!("pub fn {}({}) -> {} {{ /* implementation */ }}", 
+            op.name,
+            "client: &Client",
+            op.response_enum.name
+        )
+    };
 
-    // Build the prompt with comprehensive OpenAPI information
+    tracing::debug!("OpenAPI spec for this operation:\n{}", openapi_spec);
+    tracing::debug!("Rust function signature:\n{}", rust_function_signature);
+
+    // Build the prompt with comprehensive OpenAPI information and Rust signature
     let prompt = DocumentationPromptBuilder::build_operation_prompt(
         &op.name,
         &op.description.as_ref().map(|s| s.as_str()).unwrap_or("No description available"),
@@ -195,6 +222,7 @@ async fn generate_operation_documentation(
         &response_types,
         &examples,
         &openapi_spec,
+        &rust_function_signature,
     );
 
     tracing::info!("📖 Sending prompt to Ollama...");

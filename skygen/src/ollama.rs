@@ -151,6 +151,7 @@ impl DocumentationPromptBuilder {
         response_types: &[(String, String, String)], // (status, type, description)
         examples: &str,
         openapi_spec: &str,
+        rust_function_signature: &str, // Add the generated Rust function signature
     ) -> String {
         let parameters_section = if parameters.is_empty() {
             String::new()
@@ -186,24 +187,31 @@ impl DocumentationPromptBuilder {
             format!("\n\nOpenAPI Specification:\n```yaml\n{}\n```", openapi_spec)
         };
 
+        let rust_signature_section = if rust_function_signature.is_empty() {
+            String::new()
+        } else {
+            format!("\n\nGenerated Rust Function Signature:\n```rust\n{}\n```", rust_function_signature)
+        };
+
         format!(
             "You are an expert technical writer creating documentation for a Rust SDK generated from OpenAPI specifications.
 
 Generate comprehensive, professional documentation for the following API operation:
 
 Operation: {}
-Description: {}{}{}{}{}
+Description: {}{}{}{}{}{}
 
 Please provide:
 1. A detailed Rustdoc comment suitable for the function
-2. Usage examples in Rust
-3. Error handling guidance
-4. Best practices and recommendations
+2. Usage examples in Rust that match the function signature
+3. Error handling guidance specific to this function
+4. Best practices and recommendations for using this function
 5. Any relevant notes from the OpenAPI specification
 
 Format the response as a Rustdoc comment (///) that can be directly inserted into the generated code.
-Be concise but thorough, focusing on what Rust developers need to know to use this API effectively.",
-            operation_name, operation_description, parameters_section, responses_section, examples_section, openapi_section
+Be concise but thorough, focusing on what Rust developers need to know to use this API effectively.
+Make sure examples use the exact parameter names and types from the Rust function signature.",
+            operation_name, operation_description, parameters_section, responses_section, examples_section, openapi_section, rust_signature_section
         )
     }
 }
