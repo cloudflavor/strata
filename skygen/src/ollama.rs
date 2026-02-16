@@ -116,16 +116,17 @@ impl DocumentationPromptBuilder {
     pub fn build_operation_prompt(
         operation_name: &str,
         operation_description: &str,
-        parameters: &[(String, String)],
-        response_types: &[(String, String)],
+        parameters: &[(String, String, String)], // (name, type, description)
+        response_types: &[(String, String, String)], // (status, type, description)
         examples: &str,
+        openapi_spec: &str,
     ) -> String {
         let parameters_section = if parameters.is_empty() {
             String::new()
         } else {
             let params = parameters
                 .iter()
-                .map(|(name, desc)| format!("  - {}: {}", name, desc))
+                .map(|(name, typ, desc)| format!("  - {} ({}): {}", name, typ, desc))
                 .collect::<Vec<_>>()
                 .join("\n");
             format!("\nParameters:\n{}", params)
@@ -136,7 +137,7 @@ impl DocumentationPromptBuilder {
         } else {
             let responses = response_types
                 .iter()
-                .map(|(status, desc)| format!("  - {}: {}", status, desc))
+                .map(|(status, typ, desc)| format!("  - {}: {} - {}", status, typ, desc))
                 .collect::<Vec<_>>()
                 .join("\n");
             format!("\nResponses:\n{}", responses)
@@ -148,22 +149,30 @@ impl DocumentationPromptBuilder {
             format!("\nExamples:\n{}", examples)
         };
 
+        let openapi_section = if openapi_spec.is_empty() {
+            String::new()
+        } else {
+            format!("\n\nOpenAPI Specification:\n```yaml\n{}\n```", openapi_spec)
+        };
+
         format!(
             "You are an expert technical writer creating documentation for a Rust SDK generated from OpenAPI specifications.
 
 Generate comprehensive, professional documentation for the following API operation:
 
 Operation: {}
-Description: {}{}{}{}
+Description: {}{}{}{}{}
 
 Please provide:
 1. A detailed Rustdoc comment suitable for the function
 2. Usage examples in Rust
 3. Error handling guidance
 4. Best practices and recommendations
+5. Any relevant notes from the OpenAPI specification
 
-Format the response as a Rustdoc comment (///) that can be directly inserted into the generated code.",
-            operation_name, operation_description, parameters_section, responses_section, examples_section
+Format the response as a Rustdoc comment (///) that can be directly inserted into the generated code.
+Be concise but thorough, focusing on what Rust developers need to know to use this API effectively.",
+            operation_name, operation_description, parameters_section, responses_section, examples_section, openapi_section
         )
     }
 }

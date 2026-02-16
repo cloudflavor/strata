@@ -18,32 +18,89 @@ use skygen::generator::operation::{OperationGenerator, OperationDef};
 use skygen::generator::project::{bootstrap_lib, format_crate};
 use skygen::ollama::{DocumentationPromptBuilder, OllamaClient};
 use skygen::resolver::resolve::Resolver;
+use openapiv3::{Operation, PathItem, ReferenceOr};
 use structopt::StructOpt;
 use tokio::fs;
 use tracing_subscriber::EnvFilter;
+
+/// Find the original OpenAPI operation that corresponds to a generated operation ID
+fn find_original_operation(resolved: &openapiv3::OpenAPI, operation_id: &str) -> Option<&Operation> {
+    // Search through all paths and methods to find the matching operation
+    for (path, path_item) in &resolved.paths.paths {
+        let path_item = match path_item {
+            ReferenceOr::Item(item) => item,
+            ReferenceOr::Reference { .. } => continue,
+        };
+
+        // Check each HTTP method
+        if let Some(op) = path_item.get.as_ref() {
+            if op.operation_id.as_deref() == Some(operation_id) {
+                return Some(op);
+            }
+        }
+        if let Some(op) = path_item.put.as_ref() {
+            if op.operation_id.as_deref() == Some(operation_id) {
+                return Some(op);
+            }
+        }
+        if let Some(op) = path_item.post.as_ref() {
+            if op.operation_id.as_deref() == Some(operation_id) {
+                return Some(op);
+            }
+        }
+        if let Some(op) = path_item.delete.as_ref() {
+            if op.operation_id.as_deref() == Some(operation_id) {
+                return Some(op);
+            }
+        }
+        if let Some(op) = path_item.patch.as_ref() {
+            if op.operation_id.as_deref() == Some(operation_id) {
+                return Some(op);
+            }
+        }
+        if let Some(op) = path_item.head.as_ref() {
+            if op.operation_id.as_deref() == Some(operation_id) {
+                return Some(op);
+            }
+        }
+        if let Some(op) = path_item.options.as_ref() {
+            if op.operation_id.as_deref() == Some(operation_id) {
+                return Some(op);
+            }
+        }
+        if let Some(op) = path_item.trace.as_ref() {
+            if op.operation_id.as_deref() == Some(operation_id) {
+                return Some(op);
+            }
+        }
+    }
+    None
+}
 
 async fn generate_operation_documentation(
     ollama_client: &OllamaClient,
     model: &str,
     op: &mut OperationDef,
+    original_op: &openapiv3::Operation,
 ) -> anyhow::Result<()> {
     // Collect operation details for the prompt
-    let parameters: Vec<(String, String)> = op.params
+    let parameters: Vec<(String, String, String)> = op.params
         .iter()
         .map(|param| {
             let desc = param.description.clone().unwrap_or_else(|| "No description available".to_string());
-            (param.name.clone(), desc)
+            (param.name.clone(), param.render_type.clone(), desc)
         })
         .collect();
 
-    let response_types: Vec<(String, String)> = op.responses
+    let response_types: Vec<(String, String, String)> = op.responses
         .iter()
         .map(|resp| {
             let status = match resp.status {
                 Some(ref status) => format!("{}", status),
                 None => "default".to_string(),
             };
-            (status, resp.render_type.clone())
+            let desc = "Response for status".to_string(); // Could be enhanced with more details
+            (status, resp.render_type.clone(), desc)
         })
         .collect();
 
@@ -53,13 +110,24 @@ async fn generate_operation_documentation(
         if parameters.is_empty() { "" } else { "..." }
     );
 
-    // Build the prompt
+    // Include relevant OpenAPI spec information
+    let openapi_spec = format!(
+        "path: {}\nmethod: {}\noperationId: {}\ntags: {:?}\ndeprecated: {:?}",
+        op.path,
+        op.method,
+        original_op.operation_id.as_deref().unwrap_or("none"),
+        original_op.tags,
+        original_op.deprecated
+    );
+
+    // Build the prompt with comprehensive OpenAPI information
     let prompt = DocumentationPromptBuilder::build_operation_prompt(
         &op.name,
         &op.description.unwrap_or_else(|| "No description available".to_string()),
         &parameters,
         &response_types,
         &examples,
+        &openapi_spec,
     );
 
     // Generate documentation using Ollama
@@ -140,9 +208,20 @@ async fn main() -> anyhow::Result<()> {
                 if ollama_client.check_availability().await.unwrap_or(false) {
                     tracing::info!("Ollama server is available, generating documentation...");
                     
+                    // We need to reconstruct the mapping from operation IDs to original OpenAPI operations
+                    // This requires accessing the resolved spec
                     for op in &mut ops {
-                        if let Err(e) = generate_operation_documentation(&ollama_client, ollama_model, op).await {
-                            tracing::warn!("Failed to generate documentation for operation {}: {}", op.name, e);
+                        // Find the original operation in the resolved spec
+                        if let Some(original_op) = find_original_operation(&resolved, &op.id) {
+                            if let Err(e) = generate_operation_documentation(&ollama_client, ollama_model, op, original_op).await {
+                                tracing::warn!("Failed to generate documentation for operation {}: {}", op.name, e);
+                            }
+                        } else {
+                            tracing::warn!("Could not find original operation for {}", op.id);
+                            // Still try to generate documentation with limited info
+                            if let Err(e) = generate_operation_documentation(&ollama_client, ollama_model, op, &openapiv3::Operation::default()).await {
+                                tracing::warn!("Failed to generate documentation for operation {}: {}", op.name, e);
+                            }
                         }
                     }
                 } else {
