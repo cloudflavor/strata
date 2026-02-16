@@ -62,7 +62,20 @@ impl OllamaClient {
             stream: false,
         };
 
-        tracing::debug!("Sending prompt to Ollama model: {}", model);
+        tracing::info!("📝 Sending documentation request to Ollama model: {}", model);
+        tracing::debug!("Prompt length: {} characters", prompt.len());
+        
+        // Log a summary of the prompt for debugging
+        if tracing::level_filters::LevelFilter::DEBUG == tracing::level_filters::LevelFilter::current() {
+            let preview = if prompt.len() > 500 {
+                format!("{}...", &prompt[..500])
+            } else {
+                prompt.to_string()
+            };
+            tracing::debug!("Prompt preview:\n{}", preview);
+        }
+
+        let start_time = std::time::Instant::now();
         
         let response = self.client
             .post(&url)
@@ -72,9 +85,13 @@ impl OllamaClient {
             .await
             .with_context(|| format!("Failed to send request to Ollama at {}", url))?;
 
+        let duration = start_time.elapsed();
+        tracing::debug!("Ollama API response received in {:?}", duration);
+
         if !response.status().is_success() {
             let status = response.status();
             let error_body = response.text().await.unwrap_or_default();
+            tracing::error!("Ollama request failed with status {}: {}", status, error_body);
             anyhow::bail!("Ollama request failed with status {}: {}", status, error_body);
         }
 
@@ -84,11 +101,20 @@ impl OllamaClient {
             .with_context(|| "Failed to parse Ollama response")?;
 
         if let Some(error) = ollama_response.error {
+            tracing::error!("Ollama returned error: {}", error);
             anyhow::bail!("Ollama error: {}", error);
         }
 
         if !ollama_response.done {
             tracing::warn!("Ollama response not marked as done, but continuing anyway");
+        }
+
+        let doc_length = ollama_response.response.len();
+        tracing::info!("✅ Generated documentation: {} characters", doc_length);
+        
+        // Log the generated documentation for debugging
+        if tracing::level_filters::LevelFilter::DEBUG == tracing::level_filters::LevelFilter::current() {
+            tracing::debug!("Generated documentation:\n{}", ollama_response.response);
         }
 
         Ok(ollama_response.response)
