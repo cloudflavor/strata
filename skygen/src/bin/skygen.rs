@@ -227,10 +227,17 @@ async fn generate_operation_documentation(
         )
     };
 
+    // Provide client usage pattern context for the AI
+    let client_pattern = format!(
+        "// Typical usage pattern:\n// let client = Client::new();  // Client creation documented in client.rs\n// let response = client.{}(...).send().await?;  // Operation execution\n// match response {{\n//     ResponseVariant::Success(data) => {{ /* handle success */ }},\n//     ResponseVariant::Error(err) => {{ /* handle error */ }},\n// }}",
+        op.name
+    );
+
     tracing::debug!("OpenAPI spec for this operation:\n{}", openapi_spec);
     tracing::debug!("Rust function signature:\n{}", rust_function_signature);
+    tracing::debug!("Client pattern:\n{}", client_pattern);
 
-    // Build the prompt with comprehensive OpenAPI information, Rust signature, and SDK crate name
+    // Build the prompt with comprehensive context including client pattern
     let prompt = DocumentationPromptBuilder::build_operation_prompt(
         &op.name,
         &op.description.as_ref().map(|s| s.as_str()).unwrap_or("No description available"),
@@ -240,6 +247,7 @@ async fn generate_operation_documentation(
         &openapi_spec,
         &rust_function_signature,
         &config.crate_name, // Include SDK crate name for accurate examples
+        &client_pattern, // Include client usage pattern for context
     );
 
     tracing::info!("📖 Sending prompt to Ollama...");

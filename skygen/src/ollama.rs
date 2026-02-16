@@ -153,6 +153,7 @@ impl DocumentationPromptBuilder {
         openapi_spec: &str,
         rust_function_signature: &str, // Add the generated Rust function signature
         sdk_crate_name: &str, // Add the SDK crate name
+        client_pattern: &str, // Add the client usage pattern
     ) -> String {
         let parameters_section = if parameters.is_empty() {
             String::new()
@@ -195,6 +196,8 @@ impl DocumentationPromptBuilder {
         };
 
         let sdk_info_section = format!("\n\nSDK Information:\n- Crate Name: {}", sdk_crate_name);
+        
+        let client_context_section = format!("\n\nClient Usage Pattern:\n{}", client_pattern);
 
         format!(
             "You are an expert technical writer creating documentation for a Rust SDK generated from OpenAPI specifications.
@@ -202,22 +205,30 @@ impl DocumentationPromptBuilder {
 Generate comprehensive, professional documentation for the following API operation:
 
 Operation: {}
-Description: {}{}{}{}{}{}{}
+Description: {}{}{}{}{}{}{}{}
+
+IMPORTANT CONTEXT:
+The SDK uses a builder pattern where operations are called on a client instance
+and executed with .send().await. Here's the client pattern:
+{}
 
 Please provide:
-1. A detailed Rustdoc comment suitable for the function
-2. Usage examples in Rust that match the function signature
-3. Error handling guidance specific to this function
-4. Best practices and recommendations for using this function
-5. Any relevant notes from the OpenAPI specification
+1. A detailed Rustdoc comment for THIS operation
+2. Usage examples showing client.operation(...).send().await pattern
+3. Response handling for THIS operation's specific response variants
+4. Error handling specific to THIS operation
+5. Best practices for THIS specific operation
 
-Format the response as a Rustdoc comment (///) that can be directly inserted into the generated code.
-Be concise but thorough, focusing on what Rust developers need to know to use this API effectively.
-Make sure examples use the exact parameter names and types from the Rust function signature.
-Use the SDK crate name '{}' in all examples (e.g., use {}::{{...}}).
-Import the function from the appropriate module path.
-Show complete, compilable examples including proper imports.",
-            operation_name, operation_description, parameters_section, responses_section, examples_section, openapi_section, rust_signature_section, sdk_info_section, sdk_crate_name, sdk_crate_name
+DO NOT document client construction - that's in client.rs.
+Assume the client already exists and is properly configured.
+Focus ONLY on using THIS specific operation.
+
+Format as Rustdoc (///) for direct insertion.
+Use crate name '{}' in imports.
+Show: client.operation_name(...).send().await pattern.
+Handle the specific response enum variants shown.
+Assume reader knows client setup and tokio basics.",
+            operation_name, operation_description, parameters_section, responses_section, examples_section, openapi_section, rust_signature_section, sdk_info_section, client_context_section, sdk_crate_name, sdk_crate_name
         )
     }
 }
