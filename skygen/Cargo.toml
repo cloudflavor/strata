@@ -22,8 +22,9 @@ serde_yaml = "0.9.32"
 structopt = "0.3.26"
 taplo = "0.14.0"
 tera = "1.20.1"
-tokio = { version = "1.36.0", features = ["fs", "rt-multi-thread", "macros"] }
+tokio = { version = "1.36.0", features = ["fs", "rt-multi-thread", "macros", "process"] }
 toml =  "0.8.12"
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter", "json"] }
 indexmap = "2.2.6"
+reqwest = { version = "0.11.24", features = ["json"] }

@@ -205,6 +205,9 @@ impl OperationGenerator {
         let id = unique_operation_id(&sanitize_module_name(&base_id), seen_ids);
         let mut def = OperationDef {
             id,
+            name: base_id.clone(),
+            description: op.summary.clone().or(op.description.clone()),
+            documentation: None,
             method: method.to_string(),
             path: path.to_string(),
             tags: op.tags.clone(),
@@ -297,6 +300,9 @@ impl OperationRegistry {
 #[derive(Debug, Clone, Serialize)]
 pub struct OperationDef {
     pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub documentation: Option<String>,
     pub method: String,
     pub path: String,
     pub tags: Vec<String>,

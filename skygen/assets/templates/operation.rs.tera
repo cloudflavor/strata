@@ -21,6 +21,12 @@ use reqwest::Method;
 use reqwest::header::HeaderValue;
 use reqwest::header::CONTENT_TYPE;
 use reqwest::header::COOKIE;
+
+{% if operation.documentation is defined and operation.documentation -%}
+{{ operation.documentation | safe }}
+{% else -%}
+/// {{ operation.description | default("API operation: " ~ operation.name) | safe }}
+{% endif -%}
 {% if operation.dep_imports is defined and operation.dep_imports | length > 0 -%}
 {% for imp in operation.dep_imports -%}
 {% if imp.types | length > 1 -%}

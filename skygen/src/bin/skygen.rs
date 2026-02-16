@@ -14,12 +14,66 @@
 
 use anyhow::{bail, Context};
 use skygen::generator::model::ModelGenerator;
-use skygen::generator::operation::OperationGenerator;
+use skygen::generator::operation::{OperationGenerator, OperationDef};
 use skygen::generator::project::{bootstrap_lib, format_crate};
+use skygen::ollama::{DocumentationPromptBuilder, OllamaClient};
 use skygen::resolver::resolve::Resolver;
 use structopt::StructOpt;
 use tokio::fs;
 use tracing_subscriber::EnvFilter;
+
+async fn generate_operation_documentation(
+    ollama_client: &OllamaClient,
+    model: &str,
+    op: &mut OperationDef,
+) -> anyhow::Result<()> {
+    // Collect operation details for the prompt
+    let parameters: Vec<(String, String)> = op.params
+        .iter()
+        .map(|param| {
+            let desc = param.description.clone().unwrap_or_else(|| "No description available".to_string());
+            (param.name.clone(), desc)
+        })
+        .collect();
+
+    let response_types: Vec<(String, String)> = op.responses
+        .iter()
+        .map(|resp| {
+            let status = match resp.status {
+                Some(ref status) => format!("{}", status),
+                None => "default".to_string(),
+            };
+            (status, resp.render_type.clone())
+        })
+        .collect();
+
+    let examples = format!(
+        "```rust\n// Example usage:\nlet client = Client::new();\nlet response = client.{}({});\n```",
+        op.name,
+        if parameters.is_empty() { "" } else { "..." }
+    );
+
+    // Build the prompt
+    let prompt = DocumentationPromptBuilder::build_operation_prompt(
+        &op.name,
+        &op.description.unwrap_or_else(|| "No description available".to_string()),
+        &parameters,
+        &response_types,
+        &examples,
+    );
+
+    // Generate documentation using Ollama
+    let documentation = ollama_client
+        .generate_documentation(model, &prompt)
+        .await
+        .with_context(|| format!("Failed to generate documentation for operation {}", op.name))?;
+
+    // Store the generated documentation
+    op.documentation = Some(documentation);
+
+    tracing::debug!("Generated documentation for operation: {}", op.name);
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -72,9 +126,29 @@ async fn main() -> anyhow::Result<()> {
                 .with_context(|| "failed to collect models")?;
 
             let op_generator = OperationGenerator::new();
-            let ops = op_generator
+            let mut ops = op_generator
                 .collect_operations(&resolved, &mut registry)
                 .with_context(|| "failed to collect operations")?;
+
+            // Generate documentation using Ollama if model is specified
+            if let Some(ollama_model) = &args.ollama_model {
+                tracing::info!("Generating documentation using Ollama model: {}", ollama_model);
+                
+                let ollama_client = OllamaClient::new(None);
+                
+                // Check if Ollama is available
+                if ollama_client.check_availability().await.unwrap_or(false) {
+                    tracing::info!("Ollama server is available, generating documentation...");
+                    
+                    for op in &mut ops {
+                        if let Err(e) = generate_operation_documentation(&ollama_client, ollama_model, op).await {
+                            tracing::warn!("Failed to generate documentation for operation {}: {}", op.name, e);
+                        }
+                    }
+                } else {
+                    tracing::warn!("Ollama server is not available at {}, skipping documentation generation", ollama_client.base_url);
+                }
+            }
 
             generator
                 .finalize_registry(&mut registry)

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 pub mod generator;
+pub mod ollama;
 pub mod resolver;
 
 use core::fmt;
@@ -55,6 +56,10 @@ pub struct GenerateArgs {
     /// Skygen config for generating the SDK.
     #[structopt(short = "c", long = "config")]
     pub config: PathBuf,
+
+    /// Ollama model to use for generating documentation (format: model:name)
+    #[structopt(long = "ollama", env = "SKYGEN_OLLAMA_MODEL")]
+    pub ollama_model: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
