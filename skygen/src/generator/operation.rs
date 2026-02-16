@@ -938,11 +938,11 @@ fn op_short_name(op_id: &str, group: &str) -> String {
     }
 
     let verb = trimmed.first().copied().unwrap_or("op");
-    let resource = find_resource_token(trimmed).unwrap_or(verb);
+    let resource = find_resource_token(trimmed).unwrap_or_else(|| verb.to_string());
     if verb == resource {
         verb.to_string()
     } else {
-        format!("{verb}_{resource}")
+        format!("{}_{}", verb, resource)
     }
 }
 
@@ -953,14 +953,45 @@ fn split_tokens(input: &str) -> Vec<&str> {
         .collect()
 }
 
-fn find_resource_token<'a>(tokens: &'a [&'a str]) -> Option<&'a str> {
+fn find_resource_token<'a>(tokens: &'a [&'a str]) -> Option<String> {
     const STOP: &[&str] = &["id", "ids", "by", "for", "with", "in", "on", "at", "of", "to", "from"];
     for token in tokens.iter().rev() {
         if !STOP.contains(token) {
-            return Some(*token);
+            return Some(convert_to_snake_case(*token));
         }
     }
-    tokens.last().copied()
+    tokens.last().map(|t| convert_to_snake_case(t))
+}
+
+/// Convert a string to snake_case
+fn convert_to_snake_case(s: &str) -> String {
+    let mut result = String::new();
+    let mut prev_was_upper = false;
+    let mut prev_was_number = false;
+    
+    for (i, c) in s.char_indices() {
+        if c.is_uppercase() {
+            if i > 0 && !prev_was_upper && !result.ends_with('_') {
+                result.push('_');
+            }
+            result.extend(c.to_lowercase());
+            prev_was_upper = true;
+            prev_was_number = false;
+        } else if c.is_numeric() {
+            if i > 0 && !prev_was_number && !result.ends_with('_') {
+                result.push('_');
+            }
+            result.push(c);
+            prev_was_upper = false;
+            prev_was_number = true;
+        } else {
+            result.push(c);
+            prev_was_upper = false;
+            prev_was_number = false;
+        }
+    }
+    
+    result
 }
 
 fn unique_short_name(
