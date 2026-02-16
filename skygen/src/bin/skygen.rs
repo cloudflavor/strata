@@ -216,11 +216,17 @@ async fn main() -> anyhow::Result<()> {
                 .collect_operations(&resolved, &mut registry)
                 .with_context(|| "failed to collect operations")?;
 
-            // Generate documentation using Ollama if model is specified
-            if let Some(ollama_model) = &args.ollama_model {
+            // Generate documentation using Ollama
+            let ollama_model = args.ollama_model.clone()
+                .unwrap_or_else(|| "gpt-oss:latest".to_string());
+            
+            if args.ollama_model.is_some() {
                 tracing::info!("🤖 Generating documentation using Ollama model: {}", ollama_model);
-                
-                let ollama_client = OllamaClient::new(None);
+            } else {
+                tracing::info!("🤖 Generating documentation using default Ollama model: {}", ollama_model);
+            }
+            
+            let ollama_client = OllamaClient::new(None);
                 
                 // Check if Ollama is available
                 if ollama_client.check_availability().await.unwrap_or(false) {

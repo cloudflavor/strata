@@ -58,6 +58,7 @@ pub struct GenerateArgs {
     pub config: PathBuf,
 
     /// Ollama model to use for generating documentation (format: model:name)
+    /// Defaults to "gpt-oss:latest" if not specified
     #[structopt(long = "ollama", env = "SKYGEN_OLLAMA_MODEL")]
     pub ollama_model: Option<String>,
 }
