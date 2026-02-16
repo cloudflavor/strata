@@ -97,7 +97,17 @@ async fn process_operations_in_parallel(
     let op_ids: Vec<String> = ops.keys().cloned().collect();
     
     // Process operations concurrently with rate limiting
-    // We'll process them in batches to avoid borrowing issues
+    // NOTE: Due to Rust's borrowing rules, we cannot achieve true parallelism here.
+    // The operations are processed in batches sequentially to avoid mutable/immutable
+    // borrow conflicts. Each batch processes operations one at a time.
+    //
+    // Future architecture improvement:
+    // 1. Generate all operations first (without documentation)
+    // 2. Collect operations into a separate data structure
+    // 3. Process documentation in parallel
+    // 4. Reapply documentation to operations
+    //
+    // Current approach: Batch processing with semaphore-based concurrency control
     for batch in op_ids.chunks(concurrency_limit) {
         for op_id in batch {
             let semaphore_clone = semaphore.clone();
@@ -336,20 +346,15 @@ async fn main() -> anyhow::Result<()> {
                 .with_context(|| "failed to collect operations")?;
 
             // Generate documentation using Ollama
-            let ollama_model = args.ollama_model.clone()
-                .unwrap_or_else(|| "gpt-oss:latest".to_string());
-            
-            if args.ollama_model.is_some() {
+            // Only generate documentation if --ollama flag was explicitly provided
+            if let Some(ollama_model) = &args.ollama_model {
                 tracing::info!("🤖 Generating documentation using Ollama model: {}", ollama_model);
-            } else {
-                tracing::info!("🤖 Generating documentation using default Ollama model: {}", ollama_model);
-            }
-            
-            let ollama_client = Arc::new(OllamaClient::new(None));
-            let resolved_arc = Arc::new(resolved);
-            
-            // Check if Ollama is available
-            if ollama_client.check_availability().await.unwrap_or(false) {
+                
+                let ollama_client = Arc::new(OllamaClient::new(None));
+                let resolved_arc = Arc::new(resolved);
+                
+                // Check if Ollama is available
+                if ollama_client.check_availability().await.unwrap_or(false) {
                 tracing::info!("✅ Ollama server is available, starting documentation generation...");
                 
                 let total_ops = ops.ops.len();
@@ -361,7 +366,7 @@ async fn main() -> anyhow::Result<()> {
                 let start_time = std::time::Instant::now();
                 let (success_count, fail_count) = process_operations_in_parallel(
                     ollama_client.clone(),
-                    ollama_model.clone(),
+                    ollama_model.to_string(),
                     resolved_arc.clone(),
                     &mut ops.ops,
                     &sdk_crate_name, // Pass SDK crate name for accurate examples
@@ -383,11 +388,14 @@ async fn main() -> anyhow::Result<()> {
                 tracing::error!("❌ Ollama server is not available at {}, skipping documentation generation", ollama_client.base_url());
                 tracing::info!("💡 To use Ollama documentation, ensure the Ollama server is running and accessible");
             }
+        }
 
             generator
                 .finalize_registry(&mut registry)
                 .with_context(|| "failed to finalize models")?;
 
+            // Generate documentation in parallel AFTER all operations are created
+            // This avoids borrowing conflicts by separating creation from documentation
             bootstrap_lib(&config, registry, ops, &args.output)
                 .await
                 .with_context(|| "failed to bootstrap library")?;
