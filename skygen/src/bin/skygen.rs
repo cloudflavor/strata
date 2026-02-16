@@ -18,15 +18,15 @@ use skygen::generator::operation::{OperationGenerator, OperationDef};
 use skygen::generator::project::{bootstrap_lib, format_crate};
 use skygen::ollama::{DocumentationPromptBuilder, OllamaClient};
 use skygen::resolver::resolve::Resolver;
-use openapiv3::{Operation, PathItem, ReferenceOr};
+use openapiv3::{Operation, ReferenceOr};
 use structopt::StructOpt;
 use tokio::fs;
 use tracing_subscriber::EnvFilter;
 
 /// Find the original OpenAPI operation that corresponds to a generated operation ID
-fn find_original_operation(resolved: &openapiv3::OpenAPI, operation_id: &str) -> Option<&Operation> {
+fn find_original_operation<'a>(resolved: &'a openapiv3::OpenAPI, operation_id: &str) -> Option<&'a Operation> {
     // Search through all paths and methods to find the matching operation
-    for (path, path_item) in &resolved.paths.paths {
+    for (_path, path_item) in &resolved.paths.paths {
         let path_item = match path_item {
             ReferenceOr::Item(item) => item,
             ReferenceOr::Reference { .. } => continue,
@@ -89,7 +89,7 @@ async fn generate_operation_documentation(
     let parameters: Vec<(String, String, String)> = op.params
         .iter()
         .map(|param| {
-            let desc = param.description.clone().unwrap_or_else(|| "No description available".to_string());
+            let desc = "Parameter for API operation".to_string(); // Placeholder since description not available in OperationParam
             tracing::debug!("  Parameter: {} ({}) - {}", param.name, param.render_type, desc);
             (param.name.clone(), param.render_type.clone(), desc)
         })
@@ -131,7 +131,7 @@ async fn generate_operation_documentation(
     // Build the prompt with comprehensive OpenAPI information
     let prompt = DocumentationPromptBuilder::build_operation_prompt(
         &op.name,
-        &op.description.unwrap_or_else(|| "No description available".to_string()),
+        &op.description.as_ref().map(|s| s.as_str()).unwrap_or("No description available"),
         &parameters,
         &response_types,
         &examples,
@@ -227,49 +227,48 @@ async fn main() -> anyhow::Result<()> {
             }
             
             let ollama_client = OllamaClient::new(None);
+            
+            // Check if Ollama is available
+            if ollama_client.check_availability().await.unwrap_or(false) {
+                tracing::info!("✅ Ollama server is available, starting documentation generation...");
                 
-                // Check if Ollama is available
-                if ollama_client.check_availability().await.unwrap_or(false) {
-                    tracing::info!("✅ Ollama server is available, starting documentation generation...");
+                let total_ops = ops.ops.len();
+                tracing::info!("📚 Processing {} operations for documentation...", total_ops);
+                
+                let mut success_count = 0;
+                let mut fail_count = 0;
+                
+                // We need to reconstruct the mapping from operation IDs to original OpenAPI operations
+                // This requires accessing the resolved spec
+                for (index, (op_id, op)) in ops.ops.iter_mut().enumerate() {
+                    tracing::info!("📝 Processing operation {}/{}: {}", index + 1, total_ops, op.name);
                     
-                    let total_ops = ops.len();
-                    tracing::info!("📚 Processing {} operations for documentation...", total_ops);
-                    
-                    let mut success_count = 0;
-                    let mut fail_count = 0;
-                    
-                    // We need to reconstruct the mapping from operation IDs to original OpenAPI operations
-                    // This requires accessing the resolved spec
-                    for (index, op) in ops.iter_mut().enumerate() {
-                        tracing::info!("📝 Processing operation {}/{}: {}", index + 1, total_ops, op.name);
-                        
-                        // Find the original operation in the resolved spec
-                        if let Some(original_op) = find_original_operation(&resolved, &op.id) {
-                            if let Err(e) = generate_operation_documentation(&ollama_client, ollama_model, op, original_op).await {
-                                tracing::error!("❌ Failed to generate documentation for operation {}: {}", op.name, e);
-                                fail_count += 1;
-                            } else {
-                                success_count += 1;
-                            }
+                    // Find the original operation in the resolved spec
+                    if let Some(original_op) = find_original_operation(&resolved, op_id) {
+                        if let Err(e) = generate_operation_documentation(&ollama_client, &ollama_model, op, original_op).await {
+                            tracing::error!("❌ Failed to generate documentation for operation {}: {}", op.name, e);
+                            fail_count += 1;
                         } else {
-                            tracing::warn!("⚠️  Could not find original operation for {}, using fallback", op.id);
-                            // Still try to generate documentation with limited info
-                            if let Err(e) = generate_operation_documentation(&ollama_client, ollama_model, op, &openapiv3::Operation::default()).await {
-                                tracing::error!("❌ Failed to generate documentation for operation {}: {}", op.name, e);
-                                fail_count += 1;
-                            } else {
-                                success_count += 1;
-                            }
+                            success_count += 1;
+                        }
+                    } else {
+                        tracing::warn!("⚠️  Could not find original operation for {}, using fallback", op_id);
+                        // Still try to generate documentation with limited info
+                        if let Err(e) = generate_operation_documentation(&ollama_client, &ollama_model, op, &openapiv3::Operation::default()).await {
+                            tracing::error!("❌ Failed to generate documentation for operation {}: {}", op.name, e);
+                            fail_count += 1;
+                        } else {
+                            success_count += 1;
                         }
                     }
-                    
-                    tracing::info!("📊 Documentation generation complete: {} successful, {} failed out of {} total operations",
-                        success_count, fail_count, total_ops);
-                    
-                } else {
-                    tracing::error!("❌ Ollama server is not available at {}, skipping documentation generation", ollama_client.base_url);
-                    tracing::info!("💡 To use Ollama documentation, ensure the Ollama server is running and accessible");
                 }
+                
+                tracing::info!("📊 Documentation generation complete: {} successful, {} failed out of {} total operations",
+                    success_count, fail_count, total_ops);
+                
+            } else {
+                tracing::error!("❌ Ollama server is not available at {}, skipping documentation generation", ollama_client.base_url());
+                tracing::info!("💡 To use Ollama documentation, ensure the Ollama server is running and accessible");
             }
 
             generator

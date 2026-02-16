@@ -53,6 +53,11 @@ impl OllamaClient {
         }
     }
 
+    /// Get the base URL for the Ollama server
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     pub async fn generate_documentation(&self, model: &str, prompt: &str) -> Result<String> {
         let url = format!("{}/api/generate", self.base_url);
         
