@@ -23,6 +23,7 @@ use structopt::StructOpt;
 use tokio::fs;
 use tracing_subscriber::EnvFilter;
 
+
 /// Find the original OpenAPI operation that corresponds to a generated operation ID
 fn find_original_operation<'a>(resolved: &'a openapiv3::OpenAPI, operation_id: &str) -> Option<&'a Operation> {
     // Search through all paths and methods to find the matching operation
@@ -245,10 +246,15 @@ async fn main() -> anyhow::Result<()> {
                 let mut success_count = 0;
                 let mut fail_count = 0;
                 
-                // We need to reconstruct the mapping from operation IDs to original OpenAPI operations
-                // This requires accessing the resolved spec
-                for (index, (op_id, op)) in ops.ops.iter_mut().enumerate() {
-                    tracing::info!("📝 Processing operation {}/{}: {}", index + 1, total_ops, op.name);
+                // Process operations sequentially (for now, until we implement proper parallel processing)
+                // Note: Parallel processing is complex due to Rust's ownership rules and the need to
+                // mutate operations while borrowing the resolved spec. A future optimization would be
+                // to implement proper parallel processing with Arc<Mutex<...>> or similar.
+                
+                tracing::info!("📝 Processing {} operations sequentially...", total_ops);
+                
+                for (op_id, op) in ops.ops.iter_mut() {
+                    tracing::info!("📝 Processing operation: {}", op.name);
                     
                     // Find the original operation in the resolved spec
                     if let Some(original_op) = find_original_operation(&resolved, op_id) {
