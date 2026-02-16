@@ -65,16 +65,16 @@ pub struct GenerateArgs {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Config {
-    crate_name: String,
-    version: String,
-    edition: Option<String>,
-    description: String,
-    lib_status: String,
-    keywords: Vec<String>,
-    api_url: String,
-    authors: Vec<String>,
-    include_only: Option<Vec<String>>,
-    exclude: Option<Vec<String>>,
+    pub crate_name: String,
+    pub version: String,
+    pub edition: Option<String>,
+    pub description: String,
+    pub lib_status: String,
+    pub keywords: Vec<String>,
+    pub api_url: String,
+    pub authors: Vec<String>,
+    pub include_only: Option<Vec<String>>,
+    pub exclude: Option<Vec<String>>,
 }
 
 #[derive(Debug)]

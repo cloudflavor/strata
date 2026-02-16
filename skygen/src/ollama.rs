@@ -152,6 +152,7 @@ impl DocumentationPromptBuilder {
         examples: &str,
         openapi_spec: &str,
         rust_function_signature: &str, // Add the generated Rust function signature
+        sdk_crate_name: &str, // Add the SDK crate name
     ) -> String {
         let parameters_section = if parameters.is_empty() {
             String::new()
@@ -193,13 +194,15 @@ impl DocumentationPromptBuilder {
             format!("\n\nGenerated Rust Function Signature:\n```rust\n{}\n```", rust_function_signature)
         };
 
+        let sdk_info_section = format!("\n\nSDK Information:\n- Crate Name: {}", sdk_crate_name);
+
         format!(
             "You are an expert technical writer creating documentation for a Rust SDK generated from OpenAPI specifications.
 
 Generate comprehensive, professional documentation for the following API operation:
 
 Operation: {}
-Description: {}{}{}{}{}{}
+Description: {}{}{}{}{}{}{}
 
 Please provide:
 1. A detailed Rustdoc comment suitable for the function
@@ -210,8 +213,11 @@ Please provide:
 
 Format the response as a Rustdoc comment (///) that can be directly inserted into the generated code.
 Be concise but thorough, focusing on what Rust developers need to know to use this API effectively.
-Make sure examples use the exact parameter names and types from the Rust function signature.",
-            operation_name, operation_description, parameters_section, responses_section, examples_section, openapi_section, rust_signature_section
+Make sure examples use the exact parameter names and types from the Rust function signature.
+Use the SDK crate name '{}' in all examples (e.g., use {}::{{...}}).
+Import the function from the appropriate module path.
+Show complete, compilable examples including proper imports.",
+            operation_name, operation_description, parameters_section, responses_section, examples_section, openapi_section, rust_signature_section, sdk_info_section, sdk_crate_name, sdk_crate_name
         )
     }
 }

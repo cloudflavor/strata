@@ -86,6 +86,7 @@ async fn process_operations_in_parallel(
     ollama_model: String,
     resolved: Arc<openapiv3::OpenAPI>,
     ops: &mut indexmap::IndexMap<String, OperationDef>,
+    sdk_crate_name: &str,
     concurrency_limit: usize,
 ) -> (usize, usize) {
     let semaphore = Arc::new(Semaphore::new(concurrency_limit));
@@ -112,9 +113,23 @@ async fn process_operations_in_parallel(
                 
                 tracing::info!("📝 Processing operation: {}", op_id_clone);
                 
+                // We need to create a minimal config for the fallback case
+                let temp_config = skygen::Config {
+                    crate_name: sdk_crate_name.to_string(),
+                    version: "0.0.0".to_string(),
+                    edition: None,
+                    description: "Temporary config".to_string(),
+                    lib_status: "unstable".to_string(),
+                    keywords: vec![],
+                    api_url: "".to_string(),
+                    authors: vec![],
+                    include_only: None,
+                    exclude: None,
+                };
+                
                 // Find the original operation in the resolved spec
                 if let Some(original_op) = find_original_operation(&resolved_clone, &op_id_clone) {
-                    if let Err(e) = generate_operation_documentation(&ollama_client_clone, &ollama_model_clone, op, original_op).await {
+                    if let Err(e) = generate_operation_documentation(&ollama_client_clone, &ollama_model_clone, op, original_op, &temp_config).await {
                         tracing::error!("❌ Failed to generate documentation for operation {}: {}", op_id_clone, e);
                         fail_count += 1;
                     } else {
@@ -122,7 +137,7 @@ async fn process_operations_in_parallel(
                     }
                 } else {
                     tracing::warn!("⚠️  Could not find original operation for {}, using fallback", op_id_clone);
-                    if let Err(e) = generate_operation_documentation(&ollama_client_clone, &ollama_model_clone, op, &openapiv3::Operation::default()).await {
+                    if let Err(e) = generate_operation_documentation(&ollama_client_clone, &ollama_model_clone, op, &openapiv3::Operation::default(), &temp_config).await {
                         tracing::error!("❌ Failed to generate documentation for operation {}: {}", op_id_clone, e);
                         fail_count += 1;
                     } else {
@@ -141,6 +156,7 @@ async fn generate_operation_documentation(
     model: &str,
     op: &mut OperationDef,
     original_op: &openapiv3::Operation,
+    config: &skygen::Config,
 ) -> anyhow::Result<()> {
     tracing::info!("🔍 Generating documentation for operation: {} ({})", op.name, op.id);
     
@@ -214,7 +230,7 @@ async fn generate_operation_documentation(
     tracing::debug!("OpenAPI spec for this operation:\n{}", openapi_spec);
     tracing::debug!("Rust function signature:\n{}", rust_function_signature);
 
-    // Build the prompt with comprehensive OpenAPI information and Rust signature
+    // Build the prompt with comprehensive OpenAPI information, Rust signature, and SDK crate name
     let prompt = DocumentationPromptBuilder::build_operation_prompt(
         &op.name,
         &op.description.as_ref().map(|s| s.as_str()).unwrap_or("No description available"),
@@ -223,6 +239,7 @@ async fn generate_operation_documentation(
         &examples,
         &openapi_spec,
         &rust_function_signature,
+        &config.crate_name, // Include SDK crate name for accurate examples
     );
 
     tracing::info!("📖 Sending prompt to Ollama...");
@@ -332,12 +349,14 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("🔥 Using concurrency limit: 5 (adjustable for performance tuning)");
                 
                 // Use parallel processing for better performance
+                let sdk_crate_name = config.crate_name.clone(); // Clone the crate name for parallel processing
                 let start_time = std::time::Instant::now();
                 let (success_count, fail_count) = process_operations_in_parallel(
                     ollama_client.clone(),
                     ollama_model.clone(),
                     resolved_arc.clone(),
                     &mut ops.ops,
+                    &sdk_crate_name, // Pass SDK crate name for accurate examples
                     5, // Concurrency limit - balance between speed and server load
                 ).await;
                 
