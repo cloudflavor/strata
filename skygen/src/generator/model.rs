@@ -19,6 +19,20 @@ use serde::Serialize;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// Entrypoint for transforming resolved OpenAPI schemas into model definitions.
+///
+/// The ModelGenerator is responsible for converting OpenAPI schema definitions into
+/// Rust type definitions. It handles complex schema structures including:
+/// - Primitive types (strings, numbers, booleans)
+/// - Objects/Structs with nested properties
+/// - Arrays and collections
+/// - Composite types (oneOf, anyOf, allOf)
+/// - Reference types and schema inheritance
+///
+/// The generator also performs important optimizations:
+/// - Hoisting inline schemas to avoid duplication
+/// - Generating deterministic module names
+/// - Computing type dependencies for proper imports
+/// - Calculating render types for code generation
 #[derive(Debug, Default)]
 pub struct ModelGenerator {
     module_name_map: HashMap<String, String>,
@@ -27,6 +41,9 @@ pub struct ModelGenerator {
 impl ModelGenerator {
     /// Build a generator with an empty module-name map.
     /// Use this when you want names derived only from schema keys.
+    ///
+    /// Module names will be generated automatically from schema names using
+    /// Rust naming conventions (snake_case, keyword avoidance, etc.).
     pub fn new() -> Self {
         Self {
             module_name_map: HashMap::new(),
@@ -35,12 +52,47 @@ impl ModelGenerator {
 
     /// Build a generator with a precomputed schema-name map.
     /// Keeps module naming deterministic across runs.
+    ///
+    /// This is useful when you want consistent module names between different
+    /// generation runs or when you have specific naming requirements that
+    /// differ from the automatic naming conventions.
+    ///
+    /// # Arguments
+    ///
+    /// * `module_name_map` - HashMap mapping schema names to desired module names
+    ///
+    /// # Returns
+    ///
+    /// * `Self` - Configured ModelGenerator instance
     pub fn with_module_name_map(module_name_map: HashMap<String, String>) -> Self {
         Self { module_name_map }
     }
 
     /// Walk components.schemas and build a ModelRegistry.
     /// Hoists inline schemas and refreshes render types and deps.
+    ///
+    /// This is the main entry point for model generation. It processes all schemas
+    /// defined in the OpenAPI components.schemas section and converts them into
+    /// Rust type definitions.
+    ///
+    /// # Process Flow
+    ///
+    /// 1. Builds a deterministic module name map for all schemas
+    /// 2. Converts each schema to a ModelDef with proper Rust naming
+    /// 3. Hoists inline schemas to avoid duplication
+    /// 4. Computes type dependencies and render types
+    ///
+    /// # Arguments
+    ///
+    /// * `doc` - Resolved OpenAPI document containing schema definitions
+    ///
+    /// # Returns
+    ///
+    /// * `Result<ModelRegistry>` - Registry containing all generated model definitions
+    ///
+    /// # Errors
+    ///
+    /// * Returns `Err` if schema conversion fails or if required components are missing
     pub fn collect_models(&mut self, doc: &OpenAPI) -> Result<ModelRegistry> {
         let mut registry = ModelRegistry::default();
         let Some(components) = doc.components.as_ref() else {
@@ -72,11 +124,9 @@ impl ModelGenerator {
     pub fn schema_to_model(&self, name: &str, schema: &ReferenceOr<Schema>) -> Result<ModelDef> {
         let model_type = match schema {
             ReferenceOr::Item(schema) => self.schema_kind_to_model_type(&schema.schema_kind)?,
-            ReferenceOr::Reference { reference } => {
-                ModelType::Ref(self.module_name_for_schema(
-                    self.ref_name(reference).unwrap_or(reference),
-                ))
-            }
+            ReferenceOr::Reference { reference } => ModelType::Ref(
+                self.module_name_for_schema(self.ref_name(reference).unwrap_or(reference)),
+            ),
         };
         let render_type = model_type_to_rust(&model_type);
         let module_name = self.module_name_for_schema(name);
@@ -489,10 +539,7 @@ impl ModelGenerator {
         }
 
         if let Some(current_fields) = fields {
-            let existing_fields = name_to_fields
-                .get(&base)
-                .cloned()
-                .unwrap_or_default();
+            let existing_fields = name_to_fields.get(&base).cloned().unwrap_or_default();
             let unique_fields: BTreeSet<String> = current_fields
                 .difference(&existing_fields)
                 .cloned()
@@ -532,14 +579,9 @@ impl ModelGenerator {
             }
 
             if let Some(current_typed) = typed_fields {
-                let existing_typed = name_to_typed_fields
-                    .get(&base)
-                    .cloned()
-                    .unwrap_or_default();
-                let unique_typed: BTreeSet<String> = current_typed
-                    .difference(&existing_typed)
-                    .cloned()
-                    .collect();
+                let existing_typed = name_to_typed_fields.get(&base).cloned().unwrap_or_default();
+                let unique_typed: BTreeSet<String> =
+                    current_typed.difference(&existing_typed).cloned().collect();
                 if !unique_typed.is_empty() {
                     for suffix in candidate_suffixes(&unique_typed) {
                         let candidate = format!("{base}_{suffix}");
@@ -565,29 +607,34 @@ impl ModelGenerator {
                     .unwrap_or_default(),
                 "inline model name collision has no unique fields, trying field-based suffix"
             );
-            
+
             // Final attempt: use first unique field as suffix (like operation generator)
-            if let (Some(current_fields_ref), Some(existing_fields_ref)) = (fields, name_to_fields.get(&base)) {
-                if let Some(suffix) = get_first_unique_field_suffix(current_fields_ref, existing_fields_ref) {
+            if let (Some(current_fields_ref), Some(existing_fields_ref)) =
+                (fields, name_to_fields.get(&base))
+            {
+                if let Some(suffix) =
+                    get_first_unique_field_suffix(current_fields_ref, existing_fields_ref)
+                {
                     let candidate = format!("{base}_{suffix}");
                     if !existing.contains(&candidate) {
                         existing.insert(candidate.clone());
                         name_to_sig.insert(candidate.clone(), signature.to_string());
                         name_to_fields.insert(candidate.clone(), current_fields_ref.clone());
                         if let Some(typed_fields_ref) = typed_fields {
-                            name_to_typed_fields.insert(candidate.clone(), typed_fields_ref.clone());
+                            name_to_typed_fields
+                                .insert(candidate.clone(), typed_fields_ref.clone());
                         }
                         return candidate;
                     }
                 }
             }
-            
+
             // Fallback for structurally identical models: use a counter
             tracing::debug!(
                 base = %base,
                 "inline model name collision: models are structurally identical, using counter fallback"
             );
-            
+
             let mut counter = 1;
             loop {
                 let candidate = format!("{base}_{counter}");
@@ -610,7 +657,7 @@ impl ModelGenerator {
             current_sig = %signature,
             "inline model name collision has no field context, trying simple counter fallback"
         );
-        
+
         // Fallback for models without field context - use simple counter
         let mut counter = 1;
         loop {
@@ -1169,10 +1216,7 @@ fn dedupe_composite_variants(variants: &mut Vec<ModelType>) {
 
 /// Render all composite variants to Rust type strings.
 /// Applies boxing rules for recursive refs.
-fn render_composite_variants(
-    variants: &[ModelType],
-    boxed_types: &HashSet<String>,
-) -> Vec<String> {
+fn render_composite_variants(variants: &[ModelType], boxed_types: &HashSet<String>) -> Vec<String> {
     variants
         .iter()
         .map(|variant| render_composite_variant(variant, boxed_types))
@@ -1182,10 +1226,8 @@ fn render_composite_variants(
 fn render_composite_variant_names(variants: &[ModelType]) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out = Vec::with_capacity(variants.len());
-    let field_sets: Vec<Option<BTreeSet<String>>> = variants
-        .iter()
-        .map(variant_field_set_for_name)
-        .collect();
+    let field_sets: Vec<Option<BTreeSet<String>>> =
+        variants.iter().map(variant_field_set_for_name).collect();
 
     for (idx, variant) in variants.iter().enumerate() {
         let mut candidates = Vec::new();
@@ -1452,9 +1494,7 @@ fn build_component_module_name_map_with_schemas(
 
         for (name, schema) in items {
             let typ = generator.schema_ref_to_type(schema).map_err(|e| {
-                anyhow!(
-                    "failed to resolve schema for name collision check: {name}: {e}"
-                )
+                anyhow!("failed to resolve schema for name collision check: {name}: {e}")
             })?;
             let sig = type_signature(&typ);
             let fields = struct_field_set(&typ);
@@ -1501,10 +1541,7 @@ fn build_component_module_name_map_with_schemas(
                 fields.difference(&other_fields).cloned().collect();
             if unique_fields.is_empty() {
                 let first = group.names.first().map(|s| s.as_str()).unwrap_or("unknown");
-                let first_ref = format!(
-                    "#/components/schemas/{}",
-                    json_pointer_escape(first)
-                );
+                let first_ref = format!("#/components/schemas/{}", json_pointer_escape(first));
                 tracing::debug!(
                     base = %base,
                     name = %first,
@@ -1716,10 +1753,7 @@ fn collect_model_deps(model: &ModelDef) -> Vec<String> {
 
 /// Group dependency types by module for imports.
 /// Keeps imports compact and deterministic.
-pub fn group_dep_imports(
-    deps: &[String],
-    type_map: &HashMap<String, String>,
-) -> Vec<DepImport> {
+pub fn group_dep_imports(deps: &[String], type_map: &HashMap<String, String>) -> Vec<DepImport> {
     let mut grouped: IndexMap<String, Vec<String>> = IndexMap::new();
     for dep in deps {
         let module = type_map
@@ -1804,7 +1838,7 @@ fn number_prefix_to_word(name: &str) -> String {
             // Extract the numeric prefix
             let num_end = name.chars().take_while(|c| c.is_ascii_digit()).count();
             let (num_part, rest) = name.split_at(num_end);
-            
+
             // Convert number to word
             let word = match num_part {
                 "1" => "one",
@@ -1841,7 +1875,7 @@ pub fn sanitize_module_name(name: &str) -> String {
         out = out.replace("__", "_");
     }
     out = out.trim_matches('_').to_string();
-    
+
     // Convert numbers to words for better readability
     // This ensures valid Rust module names (can't start with numbers)
     if out.is_empty() {
@@ -2647,9 +2681,7 @@ mod tests {
             },
         );
 
-        generator
-            .hoist_inline_models(&mut registry)
-            .expect("hoist");
+        generator.hoist_inline_models(&mut registry).expect("hoist");
         let container = registry.get("Container").expect("container");
         let ModelType::Struct(def) = &container.kind else {
             panic!("expected struct model");
@@ -2896,8 +2928,14 @@ mod tests {
             }),
         ];
         let types = generator.refs_to_types(&refs).expect("refs");
-        assert!(matches!(types[0], ModelType::Primitive(PrimitiveType::String)));
-        assert!(matches!(types[1], ModelType::Primitive(PrimitiveType::Integer)));
+        assert!(matches!(
+            types[0],
+            ModelType::Primitive(PrimitiveType::String)
+        ));
+        assert!(matches!(
+            types[1],
+            ModelType::Primitive(PrimitiveType::Integer)
+        ));
     }
 
     /// Ensure any_schema_to_model_type handles oneOf composites.
@@ -3272,10 +3310,7 @@ mod tests {
     #[test]
     fn sanitize_module_name_disambiguated_encodes_separators() {
         assert_eq!(sanitize_module_name_disambiguated("a-b"), "a_dash_b");
-        assert_eq!(
-            sanitize_module_name_disambiguated("a_b"),
-            "a_underscore_b"
-        );
+        assert_eq!(sanitize_module_name_disambiguated("a_b"), "a_underscore_b");
     }
 
     /// Ensure is_rust_keyword detects known Rust keywords.
