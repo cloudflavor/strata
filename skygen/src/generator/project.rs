@@ -31,6 +31,30 @@ pub struct RenderPlan {
     extra_ctx: Option<TeraContext>,
 }
 
+/// Render multiple Tera templates with shared base context and optional extra context.
+///
+/// This function provides a centralized way to render multiple templates that share
+/// common context data. It's used to generate the various files that make up
+/// the SDK crate (lib.rs, models, operations, etc.).
+///
+/// # Arguments
+///
+/// * `tera` - The Tera template engine instance
+/// * `base_ctx` - Base context shared by all templates (configuration, models, operations)
+/// * `plans` - Array of RenderPlan structs specifying which templates to render and where
+///
+/// # Returns
+///
+/// * `Result<Vec<String>>` - Vector of rendered template strings, one per plan
+///
+/// # Errors
+///
+/// * Returns `Err` if any template rendering fails
+///
+/// # Separation of Concerns
+///
+/// This function separates the rendering logic from file I/O operations, making it
+/// easier to test template rendering independently from file system operations.
 // Separated rendering logic for easier testing
 pub fn render_project_templates(
     tera: &Tera,
@@ -87,6 +111,54 @@ pub async fn write_static_files(root: &Path, plans: &[RenderPlan]) -> Result<()>
     Ok(())
 }
 
+/// Bootstrap a complete Rust SDK crate from OpenAPI specifications.
+///
+/// This is the main entry point for SDK generation. It orchestrates the entire process
+/// of creating a functional Rust crate from OpenAPI models and operations.
+///
+/// The function performs the following steps:
+///
+/// 1. Creates the project directory structure
+/// 2. Loads all required Tera templates
+/// 3. Sets up the base template context with configuration
+/// 4. Renders all project files (Cargo.toml, lib.rs, models, operations, etc.)
+/// 5. Organizes models into modules based on their categories
+/// 6. Generates API operation files grouped by service
+/// 7. Writes all rendered files to the output directory
+///
+/// # Arguments
+///
+/// * `config` - SDK configuration (crate name, version, authors, etc.)
+/// * `registry` - Model registry containing all generated type definitions
+/// * `ops` - Operation registry containing all generated API operations
+/// * `out_dir` - Output directory where the SDK crate will be created
+///
+/// # Returns
+///
+/// * `Result<()>` - Ok if SDK generation succeeds
+/// * `Err` - If any step in the generation process fails
+///
+/// # Generated Structure
+///
+/// The function creates a standard Rust crate structure:
+/// ```
+/// output_dir/
+/// ├── Cargo.toml          # Crate configuration
+/// ├── src/
+/// │   ├── lib.rs           # Main library entry point
+/// │   ├── apis/
+/// │   │   ├── mod.rs        # API module exports
+/// │   │   └── *.rs          # Service-specific API files
+/// │   ├── models/
+/// │   │   ├── mod.rs        # Model module exports
+/// │   │   └── *.rs          # Generated model files
+/// │   └── client.rs        # HTTP client implementation
+/// ```
+///
+/// # Template Processing
+///
+/// Uses Tera templates to generate Rust code from the model and operation definitions.
+/// The templates handle proper Rust syntax, documentation, and idiomatic patterns.
 pub async fn bootstrap_lib(
     config: &Config,
     registry: ModelRegistry,
@@ -217,8 +289,7 @@ pub async fn bootstrap_lib(
     let mut models_by_module: IndexMap<String, Vec<crate::generator::model::ModelDef>> =
         IndexMap::new();
     for (_name, mut model) in registry.models.into_iter() {
-        model.dep_imports =
-            crate::generator::model::group_dep_imports(&model.deps, &type_map);
+        model.dep_imports = crate::generator::model::group_dep_imports(&model.deps, &type_map);
         let module = model_module_by_rust
             .get(&model.rust_name)
             .cloned()
@@ -355,6 +426,37 @@ pub async fn bootstrap_lib(
 }
 
 /// Load a Tera instance populated with embedded template assets.
+///
+/// This function loads the specified Tera templates from the embedded assets
+/// and configures the Tera engine with custom filters for code generation.
+///
+/// The templates are used to generate Rust code from the model and operation
+/// definitions. Each template corresponds to a different part of the generated SDK:
+///
+/// - `cargo.toml.tera` - Crate configuration
+/// - `lib.rs.tera` - Main library entry point
+/// - `model.rs.tera` - Individual model type definitions
+/// - `models.rs.tera` - Model module organization
+/// - `operations.rs.tera` - API operation implementations
+/// - `aliases.rs.tera` - Type alias definitions
+/// - `mod.rs.tera` - Module structure and exports
+///
+/// # Arguments
+///
+/// * `names` - Array of template names to load from embedded assets
+///
+/// # Returns
+///
+/// * `Result<Tera>` - Configured Tera engine with loaded templates
+///
+/// # Custom Filters
+///
+/// Registers custom Tera filters for code generation:
+/// - `sanitize_module_name` - Converts names to valid Rust module names
+///
+/// # Errors
+///
+/// * Returns `Err` if any template fails to load or contains invalid UTF-8
 pub fn load_templates(names: &[&str]) -> Result<Tera> {
     let mut tera = Tera::default();
 
@@ -541,6 +643,30 @@ async fn remove_empty_api_dirs(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Format the generated Rust crate using cargo fmt.
+///
+/// This function runs `cargo fmt` on the generated SDK crate to ensure
+/// consistent code formatting according to Rust style guidelines.
+///
+/// Formatting is applied to all Rust source files in the crate and ensures:
+/// - Consistent indentation and spacing
+/// - Proper Rust idioms and patterns
+/// - Readable code structure
+/// - Compliance with rustfmt standards
+///
+/// # Arguments
+///
+/// * `path` - Path to the generated crate directory
+///
+/// # Returns
+///
+/// * `Result<()>` - Ok if formatting succeeds
+/// * `Err` - If cargo fmt fails or returns non-zero status
+///
+/// # Requirements
+///
+/// Requires `cargo fmt` to be installed and available in the system PATH.
+/// The function changes to the crate directory before running the formatter.
 pub fn format_crate(path: &Path) -> Result<()> {
     Command::new("cargo")
         .arg("fmt")
@@ -567,6 +693,9 @@ mod tests {
         let mut ctx = TeraContext::new();
         let operation = OperationDef {
             id: "get_test".into(),
+            name: "get_test".into(),
+            description: Some("Test operation".into()),
+            documentation: Some("Test documentation".into()),
             method: "get".into(),
             path: "/test/{id}".into(),
             tags: vec![],
@@ -624,7 +753,10 @@ mod tests {
             has_cookie_params: false,
         };
         ctx.insert("operations", &vec![operation]);
-        ctx.insert("dep_imports", &Vec::<crate::generator::model::DepImport>::new());
+        ctx.insert(
+            "dep_imports",
+            &Vec::<crate::generator::model::DepImport>::new(),
+        );
         ctx.insert("uses_header_value", &false);
         ctx.insert("uses_cookie_header", &false);
         ctx.insert("uses_content_type", &false);
