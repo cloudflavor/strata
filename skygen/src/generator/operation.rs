@@ -17,7 +17,6 @@ use crate::generator::model::{
     sanitize_type_name, type_signature, DepImport, ModelDef, ModelGenerator, ModelRegistry,
     ModelType,
 };
-use std::collections::BTreeSet;
 use anyhow::{anyhow, Result};
 use indexmap::IndexMap;
 use openapiv3::{
@@ -25,16 +24,71 @@ use openapiv3::{
     RequestBody, Response, StatusCode,
 };
 use serde::Serialize;
+use std::collections::BTreeSet;
 use std::collections::HashSet;
 
+/// Generator for converting OpenAPI operations into Rust API client methods.
+///
+/// The OperationGenerator processes OpenAPI paths and operations to create Rust
+/// function definitions that can be called on the generated SDK client. It handles:
+///
+/// - All HTTP methods (GET, POST, PUT, DELETE, PATCH, etc.)
+/// - Path parameters, query parameters, headers, and cookies
+/// - Request bodies with different content types
+/// - Response handling with multiple status codes
+/// - Parameter validation and type conversion
+/// - Error handling and response enumeration
+///
+/// The generator creates a comprehensive API client interface that is type-safe
+/// and ergonomic to use, with proper Rust documentation and error handling.
 #[derive(Debug, Default)]
 pub struct OperationGenerator;
 
 impl OperationGenerator {
+    /// Create a new OperationGenerator instance.
+    ///
+    /// This is the main entry point for creating an operation generator.
+    /// The generator is stateless and can be reused across multiple
+    /// OpenAPI documents.
+    ///
+    /// # Returns
+    ///
+    /// * `Self` - New OperationGenerator instance
     pub fn new() -> Self {
         Self
     }
 
+    /// Collect all operations from an OpenAPI document and generate Rust API methods.
+    ///
+    /// This function processes all paths and operations defined in the OpenAPI
+    /// specification and converts them into Rust function definitions that
+    /// can be called on the generated SDK client.
+    ///
+    /// # Process Flow
+    ///
+    /// 1. Iterates through all paths in the OpenAPI document
+    /// 2. For each path, processes all HTTP methods (GET, POST, etc.)
+    /// 3. Converts each operation into an OperationDef with:
+    ///    - Rust function signature
+    ///    - Parameter definitions and validation
+    ///    - Request body handling
+    ///    - Response type definitions
+    ///    - Error handling strategy
+    /// 4. Generates unique operation IDs and names
+    /// 5. Computes type dependencies for proper imports
+    ///
+    /// # Arguments
+    ///
+    /// * `doc` - Resolved OpenAPI document containing path definitions
+    /// * `models` - Mutable reference to model registry for type resolution
+    ///
+    /// # Returns
+    ///
+    /// * `Result<OperationRegistry>` - Registry containing all generated operation definitions
+    ///
+    /// # Errors
+    ///
+    /// * Returns `Err` if operation processing fails or if paths contain invalid references
     pub fn collect_operations(
         &self,
         doc: &OpenAPI,
@@ -68,6 +122,28 @@ impl OperationGenerator {
         Ok(registry)
     }
 
+    /// Process all operations for a single path item.
+    ///
+    /// This helper function processes a single PathItem (representing a specific API path)
+    /// and extracts all HTTP method operations (GET, POST, PUT, etc.) from it.
+    ///
+    /// For each HTTP method found, it calls `push_op()` to convert the operation into
+    /// a Rust function definition.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - The API path being processed (e.g., "/users/{id}")
+    /// * `item` - The PathItem containing HTTP method operations
+    /// * `models` - Mutable reference to model registry for type resolution
+    /// * `registry` - Mutable reference to operation registry for storing generated operations
+    /// * `seen_ids` - Tracking set for ensuring unique operation IDs
+    /// * `seen_short_names` - Tracking map for ensuring unique short names per group
+    /// * `seen_model_prefixes` - Tracking set for ensuring unique model prefixes
+    ///
+    /// # Returns
+    ///
+    /// * `Result<()>` - Ok if all operations were processed successfully
+    /// * `Err` - If any operation processing fails
     fn collect_from_item(
         &self,
         path: &str,
@@ -186,6 +262,30 @@ impl OperationGenerator {
         Ok(())
     }
 
+    /// Convert a single OpenAPI operation into a Rust function definition.
+    ///
+    /// This is the core function that transforms an OpenAPI Operation into an OperationDef
+    /// containing all the information needed to generate Rust code. It handles:
+    ///
+    /// 1. Operation metadata (ID, name, description, tags)
+    /// 2. Parameter collection and classification (path, query, header, cookie)
+    /// 3. Request body processing and type conversion
+    /// 4. Response type generation for different status codes
+    /// 5. Response enum construction for pattern matching
+    /// 6. Dependency analysis for proper imports
+    /// 7. Unique name generation to avoid conflicts
+    ///
+    /// # Arguments
+    ///
+    /// * `method` - HTTP method (GET, POST, PUT, etc.)
+    /// * `path` - API path for this operation
+    /// * `item` - PathItem containing the operation
+    /// * `op` - The OpenAPI Operation to convert
+    /// * `models` - Mutable reference to model registry for type resolution
+    /// * `registry` - Mutable reference to operation registry for storing the result
+    /// * `seen_ids` - Tracking set for ensuring unique operation IDs
+    /// * `seen_short_names` - Tracking map for ensuring unique short names per group
+    /// * `seen_model_prefixes` - Tracking set for ensuring unique model prefixes
     fn push_op(
         &self,
         method: &str,
@@ -234,8 +334,11 @@ impl OperationGenerator {
 
         let model_gen = ModelGenerator::with_module_name_map(models.name_map.clone());
 
-        def.params =
-            collect_parameters(&model_gen, models, item.parameters.iter().chain(op.parameters.iter()));
+        def.params = collect_parameters(
+            &model_gen,
+            models,
+            item.parameters.iter().chain(op.parameters.iter()),
+        );
         for param in &def.params {
             match param.location {
                 OperationParamLocation::Path => def.has_path_params = true,
@@ -264,9 +367,7 @@ impl OperationGenerator {
         );
 
         if let Some(body) = op.request_body.as_ref() {
-            if let Ok(Some(body)) =
-                request_body_to_type(&model_gen, models, &model_prefix, body)
-            {
+            if let Ok(Some(body)) = request_body_to_type(&model_gen, models, &model_prefix, body) {
                 def.request_body = Some(body);
             }
         }
@@ -422,12 +523,7 @@ fn request_body_to_type(
     };
 
     let typ = generator.schema_ref_to_type(schema)?;
-    let typ = ensure_named_type(
-        generator,
-        models,
-        &format!("{op_name}_req"),
-        typ,
-    );
+    let typ = ensure_named_type(generator, models, &format!("{op_name}_req"), typ);
     let render_type = model_type_to_rust(&typ);
     Ok(Some(OperationBody {
         content_type,
@@ -452,13 +548,9 @@ fn responses_to_types(
     }
 
     for (status, response) in responses.responses.iter() {
-        if let Some(resp) = response_to_type(
-            generator,
-            models,
-            op_name,
-            Some(status.clone()),
-            response,
-        ) {
+        if let Some(resp) =
+            response_to_type(generator, models, op_name, Some(status.clone()), response)
+        {
             out.push(resp);
         }
     }
@@ -501,17 +593,16 @@ fn response_to_type(
         });
     };
     let typ = generator.schema_ref_to_type(schema).ok()?;
-    
+
     // Generate concrete response types but consolidate properly
     // Reuse types when schemas are identical, but keep them as concrete types
     let base_name = format!("{op_name}_resp");
     let signature = type_signature(&typ);
-    
+
     // Check if we already have a model with this exact signature
-    let model_type = if let Some(existing_model) = models.models.values().find(|model| 
-        type_signature(&model.kind) == signature && 
-        model.name.starts_with(&base_name)
-    ) {
+    let model_type = if let Some(existing_model) = models.models.values().find(|model| {
+        type_signature(&model.kind) == signature && model.name.starts_with(&base_name)
+    }) {
         // Reuse existing model with same signature
         ModelType::Ref(existing_model.name.clone())
     } else {
@@ -519,7 +610,7 @@ fn response_to_type(
         let unique_name = format!("{}_{}", base_name, response_suffix(&status));
         ensure_named_type(generator, models, &unique_name, typ)
     };
-    
+
     let render_type = model_type_to_rust(&model_type);
 
     Some(OperationResponse {
@@ -620,7 +711,6 @@ fn build_response_enum(def: &OperationDef) -> OperationResponseEnum {
     }
 }
 
-
 fn collect_operation_deps(def: &OperationDef) -> Vec<String> {
     let mut deps = indexmap::IndexSet::new();
     for param in &def.params {
@@ -636,7 +726,6 @@ fn collect_operation_deps(def: &OperationDef) -> Vec<String> {
     out.sort();
     out
 }
-
 
 fn collect_deps_from_type(typ: &ModelType, deps: &mut indexmap::IndexSet<String>) {
     match typ {
@@ -690,9 +779,12 @@ fn collect_parameters<'a>(
 
         match param {
             Parameter::Query { parameter_data, .. } => {
-                if let Some(param) =
-                    parameter_to_param(generator, models, parameter_data, OperationParamLocation::Query)
-                {
+                if let Some(param) = parameter_to_param(
+                    generator,
+                    models,
+                    parameter_data,
+                    OperationParamLocation::Query,
+                ) {
                     let key = (param.location, param.name.clone());
                     if seen.insert(key) {
                         out.push(param);
@@ -700,9 +792,12 @@ fn collect_parameters<'a>(
                 }
             }
             Parameter::Header { parameter_data, .. } => {
-                if let Some(param) =
-                    parameter_to_param(generator, models, parameter_data, OperationParamLocation::Header)
-                {
+                if let Some(param) = parameter_to_param(
+                    generator,
+                    models,
+                    parameter_data,
+                    OperationParamLocation::Header,
+                ) {
                     let key = (param.location, param.name.clone());
                     if seen.insert(key) {
                         out.push(param);
@@ -710,9 +805,12 @@ fn collect_parameters<'a>(
                 }
             }
             Parameter::Path { parameter_data, .. } => {
-                if let Some(param) =
-                    parameter_to_param(generator, models, parameter_data, OperationParamLocation::Path)
-                {
+                if let Some(param) = parameter_to_param(
+                    generator,
+                    models,
+                    parameter_data,
+                    OperationParamLocation::Path,
+                ) {
                     let key = (param.location, param.name.clone());
                     if seen.insert(key) {
                         out.push(param);
@@ -720,9 +818,12 @@ fn collect_parameters<'a>(
                 }
             }
             Parameter::Cookie { parameter_data, .. } => {
-                if let Some(param) =
-                    parameter_to_param(generator, models, parameter_data, OperationParamLocation::Cookie)
-                {
+                if let Some(param) = parameter_to_param(
+                    generator,
+                    models,
+                    parameter_data,
+                    OperationParamLocation::Cookie,
+                ) {
                     let key = (param.location, param.name.clone());
                     if seen.insert(key) {
                         out.push(param);
@@ -840,7 +941,9 @@ fn primitive_from_type(
 ) -> Option<crate::generator::model::PrimitiveType> {
     match typ {
         ModelType::Primitive(p) => Some(*p),
-        ModelType::Ref(name) => models.get(name).and_then(|model| primitive_from_type(&model.kind, models)),
+        ModelType::Ref(name) => models
+            .get(name)
+            .and_then(|model| primitive_from_type(&model.kind, models)),
         _ => None,
     }
 }
@@ -913,7 +1016,6 @@ fn needs_named_model(typ: &ModelType) -> bool {
     }
 }
 
-
 fn response_suffix(status: &Option<StatusCode>) -> String {
     match status {
         Some(StatusCode::Code(code)) => format!("{code}"),
@@ -947,14 +1049,13 @@ fn op_short_name(op_id: &str, group: &str) -> String {
 }
 
 fn split_tokens(input: &str) -> Vec<&str> {
-    input
-        .split('_')
-        .filter(|part| !part.is_empty())
-        .collect()
+    input.split('_').filter(|part| !part.is_empty()).collect()
 }
 
 fn find_resource_token<'a>(tokens: &'a [&'a str]) -> Option<String> {
-    const STOP: &[&str] = &["id", "ids", "by", "for", "with", "in", "on", "at", "of", "to", "from"];
+    const STOP: &[&str] = &[
+        "id", "ids", "by", "for", "with", "in", "on", "at", "of", "to", "from",
+    ];
     for token in tokens.iter().rev() {
         if !STOP.contains(token) {
             return Some(convert_to_snake_case(*token));
@@ -968,7 +1069,7 @@ fn convert_to_snake_case(s: &str) -> String {
     let mut result = String::new();
     let mut prev_was_upper = false;
     let mut prev_was_number = false;
-    
+
     for (i, c) in s.char_indices() {
         if c.is_uppercase() {
             if i > 0 && !prev_was_upper && !result.ends_with('_') {
@@ -990,7 +1091,7 @@ fn convert_to_snake_case(s: &str) -> String {
             prev_was_number = false;
         }
     }
-    
+
     result
 }
 
@@ -1054,9 +1155,7 @@ fn unique_short_name(
         candidates = ?candidates,
         "operation short name collision could not be resolved without suffixes"
     );
-    panic!(
-        "operation name collision in group '{group}' for op '{op_id}' (base '{base}')"
-    );
+    panic!("operation name collision in group '{group}' for op '{op_id}' (base '{base}')");
 }
 
 fn unique_model_prefix(
@@ -1240,3 +1339,193 @@ fn unique_field_suffix(
     out.into_iter().next()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::generator::model::*;
+    use openapiv3::*;
+
+    /// Create a minimal OpenAPI document with empty components.
+    fn make_doc() -> OpenAPI {
+        OpenAPI {
+            components: Some(Components::default()),
+            ..OpenAPI::default()
+        }
+    }
+
+    #[test]
+    fn handles_empty_responses() {
+        let mut doc = make_doc();
+        let mut models = ModelRegistry::default();
+        let mut item = PathItem::default();
+        let mut op = Operation::default();
+
+        // Operation with no responses defined
+        op.responses = Responses::default();
+
+        item.get = Some(op);
+        doc.paths
+            .paths
+            .insert("/empty".into(), ReferenceOr::Item(item));
+
+        let registry = OperationGenerator::new()
+            .collect_operations(&doc, &mut models)
+            .expect("collect");
+
+        let op = registry.get("get_empty").expect("operation");
+        assert_eq!(op.response_enum.variants.len(), 0);
+    }
+
+    #[test]
+    fn handles_only_default_response() {
+        let mut doc = make_doc();
+        let mut models = ModelRegistry::default();
+        let mut item = PathItem::default();
+        let mut op = Operation::default();
+
+        let mut response = Response::default();
+        response.content.insert(
+            "application/json".into(),
+            MediaType {
+                schema: Some(ReferenceOr::Item(Schema {
+                    schema_data: Default::default(),
+                    schema_kind: openapiv3::SchemaKind::Type(Type::Boolean(Default::default())),
+                })),
+                ..Default::default()
+            },
+        );
+        op.responses.default = Some(ReferenceOr::Item(response));
+
+        item.get = Some(op);
+        doc.paths
+            .paths
+            .insert("/default-only".into(), ReferenceOr::Item(item));
+
+        let registry = OperationGenerator::new()
+            .collect_operations(&doc, &mut models)
+            .expect("collect");
+
+        let op = registry.get("get_default_only").expect("operation");
+        assert_eq!(op.response_enum.variants.len(), 1);
+        assert_eq!(op.response_enum.variants[0].name, "Error");
+        assert!(op.response_enum.variants[0].is_default);
+    }
+
+    #[test]
+    fn handles_multiple_success_responses() {
+        let mut doc = make_doc();
+        let mut models = ModelRegistry::default();
+        let mut item = PathItem::default();
+        let mut op = Operation::default();
+
+        // Multiple success responses (200, 201, 202)
+        let mut resp200 = Response::default();
+        resp200.content.insert(
+            "application/json".into(),
+            MediaType {
+                schema: Some(ReferenceOr::Item(Schema {
+                    schema_data: Default::default(),
+                    schema_kind: openapiv3::SchemaKind::Type(Type::String(Default::default())),
+                })),
+                ..Default::default()
+            },
+        );
+        op.responses
+            .responses
+            .insert(StatusCode::Code(200), ReferenceOr::Item(resp200));
+
+        let mut resp201 = Response::default();
+        resp201.content.insert(
+            "application/json".into(),
+            MediaType {
+                schema: Some(ReferenceOr::Item(Schema {
+                    schema_data: Default::default(),
+                    schema_kind: openapiv3::SchemaKind::Type(Type::Integer(Default::default())),
+                })),
+                ..Default::default()
+            },
+        );
+        op.responses
+            .responses
+            .insert(StatusCode::Code(201), ReferenceOr::Item(resp201));
+
+        item.get = Some(op);
+        doc.paths
+            .paths
+            .insert("/multi-success".into(), ReferenceOr::Item(item));
+
+        let registry = OperationGenerator::new()
+            .collect_operations(&doc, &mut models)
+            .expect("collect");
+
+        let op = registry.get("get_multi_success").expect("operation");
+        // Should consolidate all success responses into single Success variant
+        assert_eq!(op.response_enum.variants.len(), 1);
+        assert_eq!(op.response_enum.variants[0].name, "Success");
+    }
+
+    #[test]
+    fn handles_range_status_codes() {
+        let mut doc = make_doc();
+        let mut models = ModelRegistry::default();
+        let mut item = PathItem::default();
+        let mut op = Operation::default();
+
+        // Response with status code range
+        let mut response = Response::default();
+        response.content.insert(
+            "application/json".into(),
+            MediaType {
+                schema: Some(ReferenceOr::Item(Schema {
+                    schema_data: Default::default(),
+                    schema_kind: openapiv3::SchemaKind::Type(Type::Boolean(Default::default())),
+                })),
+                ..Default::default()
+            },
+        );
+        op.responses
+            .responses
+            .insert(StatusCode::Range(4), ReferenceOr::Item(response));
+
+        item.get = Some(op);
+        doc.paths
+            .paths
+            .insert("/range".into(), ReferenceOr::Item(item));
+
+        let registry = OperationGenerator::new()
+            .collect_operations(&doc, &mut models)
+            .expect("collect");
+
+        let op = registry.get("get_range").expect("operation");
+        assert_eq!(op.response_enum.variants.len(), 1);
+        assert_eq!(op.response_enum.variants[0].name, "Error");
+        assert_eq!(op.response_enum.variants[0].status_match, "400..=499");
+    }
+
+    #[test]
+    fn handles_operation_with_no_responses() {
+        let mut doc = make_doc();
+        let mut models = ModelRegistry::default();
+        let mut item = PathItem::default();
+        let mut op = Operation::default();
+
+        // Operation with completely empty responses
+        op.responses = Responses {
+            responses: IndexMap::new(),
+            default: None,
+            extensions: Default::default(),
+        };
+
+        item.get = Some(op);
+        doc.paths
+            .paths
+            .insert("/no-responses".into(), ReferenceOr::Item(item));
+
+        let registry = OperationGenerator::new()
+            .collect_operations(&doc, &mut models)
+            .expect("collect");
+
+        let op = registry.get("get_no_responses").expect("operation");
+        assert_eq!(op.response_enum.variants.len(), 0);
+    }
+}
