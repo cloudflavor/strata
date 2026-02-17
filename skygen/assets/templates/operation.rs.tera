@@ -25,7 +25,7 @@ use reqwest::header::COOKIE;
 {% if operation.documentation is defined and operation.documentation -%}
 {{ operation.documentation | safe }}
 {% else -%}
-/// {{ operation.description | default("API operation: " ~ operation.name) | safe }}
+/// {%- if operation.description %}{{ operation.description | safe }}{%- else %}API operation: {{ operation.name }}{%- endif %}
 {% endif -%}
 {% if operation.dep_imports is defined and operation.dep_imports | length > 0 -%}
 {% for imp in operation.dep_imports -%}

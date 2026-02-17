@@ -57,7 +57,7 @@ impl<'a> {{ service_name }}<'a> {
 {%- if operation.documentation is defined and operation.documentation %}
     {{ operation.documentation | safe }}
 {%- else %}
-    /// {{ operation.description | default("API operation: " ~ operation.name) | safe }}
+    /// {%- if operation.description %}{{ operation.description | safe }}{%- else %}API operation{%- endif %}
 {%- endif %}
     pub fn {{ operation.short_name }}(&'a self
 {%- for param in operation.required_params %}
