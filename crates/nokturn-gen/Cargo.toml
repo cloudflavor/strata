@@ -1,0 +1,25 @@
+[package]
+name = "nokturn-gen"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Generates Rust SDKs for cloud providers from their OpenAPIv3 specs"
+readme = "README.md"
+
+[dependencies]
+anyhow.workspace = true
+serde_yaml.workspace = true
+serde.workspace = true
+tokio = { workspace = true, features = ["fs", "rt-multi-thread", "macros"] }
+include_dir = {version = "0.7.4", features = ["glob"] }
+reqwest = { version = "0.13.2", features = ["json"] }
+structopt = "0.3.26"
+taplo = "0.14.0"
+tera = "1.20.1"
+toml = "1.0.3"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter", "json"] }
+
+nokturn-core = { path = "../nokturn-core", features = ["generator"] }

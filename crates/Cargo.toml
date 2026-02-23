@@ -1,0 +1,19 @@
+[workspace]
+members = ["nokturn-core",
+  "nokturn-gen",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Victor Palade <victor@cloudflavor.io>"]
+license = "Apache-2.0"
+repository = "https://github.com/cloudflavor/skygen"
+
+[workspace.dependencies]
+tokio = "1.49.0" 
+anyhow = "1.0"
+serde = "1.0.228"
+serde_json = "1.0.149"
+serde_yaml = "0.9.34"

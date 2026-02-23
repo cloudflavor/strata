@@ -1,0 +1,17 @@
+[package]
+name = "nokturn-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+openapiv3 = "2.2.0"
+anyhow.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+
+[features]
+default = []
+generator = []

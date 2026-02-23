@@ -1,0 +1,59 @@
+# ----------------------------
+# Complexity thresholds
+# ----------------------------
+
+too-many-arguments-threshold = 6
+too-many-lines-threshold = 120
+cognitive-complexity-threshold = 20
+type-complexity-threshold = 250
+
+enum-variant-name-threshold = 3
+large-error-threshold = 256
+pass-by-value-size-limit = 256
+
+# ----------------------------
+# API discipline
+# ----------------------------
+
+disallowed-methods = [
+  "std::mem::uninitialized",
+  "std::mem::zeroed",
+  "std::thread::sleep",
+]
+
+disallowed-types = [
+  "std::collections::LinkedList",
+]
+
+# ----------------------------
+# Documentation strictness
+# ----------------------------
+
+missing-docs-in-crate-items = true
+check-private-items = false
+
+# ----------------------------
+# Panic / unwrap discipline
+# ----------------------------
+
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+
+# ----------------------------
+# Numeric / literal hygiene
+# ----------------------------
+
+literal-representation-threshold = 10
+
+# ----------------------------
+# Module structure
+# ----------------------------
+
+avoid-breaking-exported-api = true
+
+# ----------------------------
+# Misc sanity
+# ----------------------------
+
+warn-on-all-wildcard-imports = true
