@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use anyhow::Context;
-use nokturn_core::resolve_schema;
+use nokturn_core::resolve_spec;
 use nokturn_gen::{Cli, Commands, Config};
 use structopt::StructOpt;
 use tokio::fs;
@@ -49,7 +49,7 @@ async fn main() -> anyhow::Result<()> {
             let d = fs::read_to_string(&args.schema)
                 .await
                 .with_context(|| "failed to read openapi schema")?;
-            let _resolved = resolve_schema(d.as_str(), ext)
+            let _resolved = resolve_spec(d.as_str(), ext)
                 .with_context(|| " failed to resolve openapi schema")?;
         }
     }
