@@ -12,28 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod ir;
 pub mod resolver;
 
 use crate::resolver::EagerResolver;
 use anyhow::{Result, bail};
-use std::collections::HashMap;
+use tracing::trace;
 
-pub struct ResolvedSchema;
-
-pub struct ResolvedSpec {
-    pub models: HashMap<String, ResolvedSchema>,
-}
-
-pub fn resolve_schema(spec: &str, ext: &str) -> Result<()> {
+pub fn resolve_spec(spec: &str, ext: &str) -> Result<()> {
+    trace!("resolving schema");
     let s = sanitize_spec(spec);
     let schema = load_openapiv3(s.as_str(), ext)?;
-    let resolver = EagerResolver::new(schema);
+    let mut resolver = EagerResolver::new(&schema);
     let _resolved_schema = resolver.resolve();
 
     Ok(())
 }
 
 pub fn load_openapiv3(spec: &str, ext: &str) -> Result<openapiv3::OpenAPI> {
+    trace!("loading openapiv3 spec from file");
     let schema_json: serde_json::Value = match ext {
         "yaml" | "yml" => serde_yaml::from_str(spec)?,
         "json" => serde_json::from_str(spec)?,
