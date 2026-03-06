@@ -15,26 +15,22 @@
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
+use openapiv3::RequestBody;
 use openapiv3::{
     Callback, Header, OpenAPI, Parameter, PathItem, ReferenceOr, Response, Responses, Schema,
 };
 use std::collections::HashMap;
-use tracing::field::debug;
 use tracing::{debug, warn};
-
-pub struct ResolvedSchema;
-
-pub struct ResolvedSpec {
-    pub models: HashMap<String, ResolvedSchema>,
-}
 
 #[derive(Debug)]
 pub(crate) struct ResolvedCache<'a> {
+    paths: HashMap<&'a str, &'a PathItem>,
     params: HashMap<&'a str, &'a Parameter>,
     schemas: HashMap<&'a str, &'a Schema>,
     responses: HashMap<String, &'a Response>,
     headers: HashMap<&'a str, &'a Header>,
     callbacks: HashMap<&'a str, &'a Callback>,
+    req_bodies: HashMap<&'a str, &'a RequestBody>,
 }
 
 pub struct EagerResolver<'a> {
@@ -46,7 +42,8 @@ pub struct EagerResolver<'a> {
 
 impl<'a> EagerResolver<'a> {
     pub fn new(spec: &'a OpenAPI) -> Self {
-        let (param_cap, schema_cap, response_cap, header_cap, callback_cap) = spec
+        let paths_cap = spec.paths.paths.len();
+        let (param_cap, schema_cap, response_cap, header_cap, callback_cap, rbody_cap) = spec
             .components
             .as_ref()
             .map(|c| {
@@ -56,6 +53,7 @@ impl<'a> EagerResolver<'a> {
                     c.responses.len(),
                     c.headers.len(),
                     c.callbacks.len(),
+                    c.request_bodies.len(),
                 )
             })
             .unwrap_or_default();
@@ -64,6 +62,8 @@ impl<'a> EagerResolver<'a> {
             spec,
             // resolved: None,
             cache: ResolvedCache {
+                req_bodies: HashMap::with_capacity(rbody_cap),
+                paths: HashMap::with_capacity(paths_cap),
                 params: HashMap::with_capacity(param_cap),
                 schemas: HashMap::with_capacity(schema_cap),
                 responses: HashMap::with_capacity(response_cap),
@@ -74,25 +74,23 @@ impl<'a> EagerResolver<'a> {
         }
     }
 
-    pub fn resolve(&mut self) -> Result<ResolvedSpec> {
+    pub fn resolve(&mut self) -> Result<()> {
         self.resolve_paths()
             .with_context(|| "failed to resolve paths")?;
+        debug!("{:#?}", self.cache.req_bodies);
 
-        let resolved = ResolvedSpec {
-            models: HashMap::new(),
-        };
-
-        Ok(resolved)
+        Ok(())
     }
 
     fn resolve_paths(&mut self) -> Result<()> {
         for (name, path_item) in self.spec.paths.iter() {
             match path_item {
-                ReferenceOr::Reference { reference } => {
-                    self.resolve_ref(reference)?;
-                }
                 ReferenceOr::Item(item) => {
                     self.resolve_operation(item)?;
+                    self.cache.paths.insert(name, item);
+                }
+                ReferenceOr::Reference { reference } => {
+                    self.resolve_ref(reference)?;
                 }
             }
         }
@@ -114,6 +112,7 @@ impl<'a> EagerResolver<'a> {
         .flatten()
         {
             self.resolve_responses(&op.responses)?;
+            self.resolve_req_body(op.request_body)?;
         }
 
         Ok(())
@@ -123,10 +122,8 @@ impl<'a> EagerResolver<'a> {
         for (status, resp) in responses.responses.iter() {
             match resp {
                 ReferenceOr::Item(item) => {
-                    // let x = item.headers.iter();
                     self.resolve_headers(item.headers.iter())?;
-
-                    // self.cache.responses.insert(status.to_string(), item);
+                    self.cache.responses.insert(status.to_string(), item);
                 }
                 ReferenceOr::Reference { reference } => self.resolve_ref(reference.as_ref())?,
             }
@@ -148,6 +145,13 @@ impl<'a> EagerResolver<'a> {
             }
         }
         Ok(())
+    }
+
+    fn resolve_req_body_ref(&mut self, req_body: &'a RequestBody) -> Result<()> {
+        match req_body {
+            ReferenceOr::Item(item) => Ok(()),
+            ReferenceOr::Reference { reference } => self.resolve_ref(reference),
+        }
     }
 
     fn resolve_parameter_ref(&mut self, name: &'a str) -> Result<()> {
