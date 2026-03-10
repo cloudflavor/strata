@@ -6,7 +6,7 @@ authors = [
   "Author1 <author1@example.com>"
   "Author2 <author2@example.com>"
 ]
-# Some keywords are hardcoded (sdk, openapi, api, skygen), this should contain the 
+# Some keywords are hardcoded (sdk, openapi, api, nokturn), this should contain the 
 # crate name and other related words.
 keywords = [
   "my-crate"
