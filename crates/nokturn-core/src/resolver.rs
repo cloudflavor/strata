@@ -51,15 +51,15 @@ enum HttpMethod {
 
 impl HttpMethod {
     fn from_str(value: &str) -> Option<Self> {
-        match value.to_ascii_lowercase().as_str() {
-            "get" => Some(Self::Get),
-            "put" => Some(Self::Put),
-            "post" => Some(Self::Post),
-            "delete" => Some(Self::Delete),
-            "patch" => Some(Self::Patch),
-            "options" => Some(Self::Options),
-            "head" => Some(Self::Head),
-            "trace" => Some(Self::Trace),
+        match value {
+            "get" | "GET" => Some(Self::Get),
+            "put" | "PUT" => Some(Self::Put),
+            "post" | "POST" => Some(Self::Post),
+            "delete" | "DELETE" => Some(Self::Delete),
+            "patch" | "PATCH" => Some(Self::Patch),
+            "options" | "OPTIONS" => Some(Self::Options),
+            "head" | "HEAD" => Some(Self::Head),
+            "trace" | "TRACE" => Some(Self::Trace),
             _ => None,
         }
     }
