@@ -1,6 +1,6 @@
-# Strata - Rust OpenAPI v3 tooling
+# Nokturn – Rust OpenAPI v3 SDK Generator
 
-Strata is a Rust workspace that hosts the Nokturn components: a core OpenAPI v3 loader/resolver and the `nokturn-gen` experimental SDK generator CLI.
+Nokturn is a Rust toolchain that turns an OpenAPI v3 specification into an idiomatic Rust SDK. The `nokturn-gen` CLI can generate SDKs for Cloudflare, DigitalOcean, Exoscale, Hetzner, Scaleway and any provider that publishes an OpenAPI spec.
 
 ## Workspace layout
 
@@ -15,6 +15,7 @@ Code generation is in progress. Today `nokturn-gen generate` validates the confi
 
 ```bash
 cargo build --manifest-path crates/Cargo.toml -p nokturn-gen
+cargo install --path ./crates/nokturn-gen
 ```
 
 ## Usage
@@ -26,6 +27,7 @@ cargo run --manifest-path crates/Cargo.toml -p nokturn-gen -- \
   --schema open-api-specs/digitalocean/digitalocean.yaml \
   --config open-api-specs/digitalocean/config.toml \
   --output-dir generated/digitalocean
+nokturn-gen generate --schema <schema-file> --output-dir <output-directory> --config <config-file>
 ```
 
 You can also run the binary directly after a release build:
@@ -36,13 +38,14 @@ You can also run the binary directly after a release build:
   --schema open-api-specs/digitalocean/digitalocean.yaml \
   --config open-api-specs/digitalocean/config.toml \
   --output-dir generated/digitalocean
+nokturn-gen --log-level debug generate --schema openapi.yaml --config config.toml --output-dir ./output
 ```
 
 Supported log levels: `trace`, `debug`, `info`, `warn`, `error`.
 
 ## Configuration
 
-`nokturn-gen` expects a TOML config with the following fields:
+Nokturn uses a TOML configuration file to customize the generated SDK. Here's an example configuration:
 
 ```toml
 crate_name = "digitalocean"
@@ -61,6 +64,26 @@ exclude = ["InternalModel"]
 
 In-tree examples live under `open-api-specs/*/config.toml`.
 
-## License
+### Configuration Options
 
-Apache-2.0 - see the `LICENSE` file.
+- `crate_name`: The name of the generated Rust crate
+- `version`: The version of the generated crate
+- `edition`: The Rust edition to use (defaults to "2021")
+- `description`: A brief description of the crate
+- `lib_status`: The maintenance status of the library (e.g., "active", "deprecated", "experimental")
+- `keywords`: A list of keywords for the crate
+- `api_url`: The base URL for the API
+- `authors`: A list of authors for the crate
+- `include_only`: (Optional) A list of models to include (if not specified, all models are included)
+- `exclude`: (Optional) A list of models to exclude
+
+## Generating the SDK
+
+```bash
+nokturn-gen generate \
+  --schema path/to/openapi.yaml \
+  --config config.toml \
+  --output-dir ./output
+```
+
+The output will contain a Cargo crate with a typical `src/` layout and a `Cargo.toml` that exposes optional features like `rustls`, `native-tls` and `http2`.
