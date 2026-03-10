@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2024"
 authors = ["Victor Palade <victor@cloudflavor.io>"]
 license = "Apache-2.0"
-repository = "https://github.com/cloudflavor/skygen"
+repository = "https://github.com/cloudflavor/nokturn"
 
 [workspace.dependencies]
 anyhow = "1.0"
